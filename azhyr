@@ -1,0 +1,894 @@
+--!strict
+-- DevTools (single file). Debug menu for YOUR OWN experience: god mode, speed, jump, teleport
+-- (coordinates / player / waypoint), noclip, fly, live HUD.
+--
+-- INSTALL: insert a normal *Script* (not LocalScript) in ServerScriptService and paste this whole file.
+-- Press F4 in a playtest. In Studio everyone is allowed; in a published server only Config.AllowedUserIds.
+-- Waypoints: parts inside Workspace.DevWaypoints (the Studio plugin creates them, or make them by hand).
+-- How it works: the server half validates every action; it then clones this same Script with
+-- RunContext = Client into StarterPlayerScripts, and that copy runs the menu half.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local StarterPlayer = game:GetService("StarterPlayer")
+local UserInputService = game:GetService("UserInputService")
+local Stats = game:GetService("Stats")
+local Workspace = game:GetService("Workspace")
+
+------------------------------------------------------------------------ Config
+-- Shared settings for the DevTools runtime (server and client both read this).
+local Config = {
+	-- In Roblox Studio (Play Solo / Team Test) every player is authorized.
+	StudioAlwaysAllowed = true,
+	-- UserIds allowed in a published server. Empty + not in Studio = the runtime stays inert
+	-- and does not even create its RemoteFunction.
+	AllowedUserIds = {} :: { number },
+
+	ToggleKey = Enum.KeyCode.F4,
+	WaypointFolderName = "DevWaypoints", -- Workspace folder filled by the Studio plugin
+	RequestsPerSecond = 20,
+	FlySpeed = 60, -- studs per second
+
+	Limits = {
+		MaxWalkSpeed = 300,
+		MaxJumpPower = 500,
+		MaxCoordinate = 100000,
+	},
+	Defaults = {
+		WalkSpeed = 16,
+		JumpPower = 50,
+	},
+}
+
+------------------------------------------------------------------------- Util
+-- Pure helpers with no Roblox dependencies, so they can be checked with the plain Luau CLI.
+local Util = {}
+
+export type Vec3 = { x: number, y: number, z: number }
+
+function Util.isFiniteNumber(value: any): boolean
+	return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
+end
+
+function Util.isInRange(value: any, minimum: number, maximum: number): boolean
+	return Util.isFiniteNumber(value) and value >= minimum and value <= maximum
+end
+
+-- Accepts "x y z", "x, y, z" or "x;y;z". Returns nil unless there are exactly three finite numbers.
+function Util.parseVec3(text: string): Vec3?
+	local numbers: { number } = {}
+	for token in string.gmatch(text, "[^%s,;]+") do
+		local n = tonumber(token)
+		if n == nil or not Util.isFiniteNumber(n) then
+			return nil
+		end
+		table.insert(numbers, n)
+	end
+	if #numbers ~= 3 then
+		return nil
+	end
+	return { x = numbers[1], y = numbers[2], z = numbers[3] }
+end
+
+function Util.formatVec3(x: number, y: number, z: number): string
+	return string.format("%.2f, %.2f, %.2f", x, y, z)
+end
+
+function Util.trim(text: string): string
+	return (string.gsub(text, "^%s*(.-)%s*$", "%1"))
+end
+
+------------------------------------------------------------------------ Server
+local function runServer()
+	local inStudioAllowed = Config.StudioAlwaysAllowed and RunService:IsStudio()
+	if not inStudioAllowed and #Config.AllowedUserIds == 0 then
+		-- Live server and nobody allow-listed: expose nothing.
+		return
+	end
+
+	type PlayerState = {
+		god: boolean,
+		walkSpeed: number?,
+		jumpPower: number?,
+		godConnection: RBXScriptConnection?,
+		recentRequests: { number },
+	}
+
+	type Reply = { ok: boolean, message: string, data: any? }
+
+	local FORCEFIELD_NAME = "DevToolsGodMode"
+	local states: { [Player]: PlayerState } = {}
+
+	local function reply(ok: boolean, message: string, data: any?): Reply
+		return { ok = ok, message = message, data = data }
+	end
+
+	local function isAuthorized(player: Player): boolean
+		if inStudioAllowed then
+			return true
+		end
+		return table.find(Config.AllowedUserIds, player.UserId) ~= nil
+	end
+
+	local function getState(player: Player): PlayerState
+		local state = states[player]
+		if not state then
+			state = { god = false, walkSpeed = nil, jumpPower = nil, godConnection = nil, recentRequests = {} }
+			states[player] = state
+		end
+		return state
+	end
+
+	local function allowRequest(state: PlayerState): boolean
+		local now = os.clock()
+		local recent = state.recentRequests
+		while #recent > 0 and now - recent[1] > 1 do
+			table.remove(recent, 1)
+		end
+		if #recent >= Config.RequestsPerSecond then
+			return false
+		end
+		table.insert(recent, now)
+		return true
+	end
+
+	local function getHumanoid(player: Player): Humanoid?
+		local character = player.Character
+		if not character then
+			return nil
+		end
+		return character:FindFirstChildOfClass("Humanoid")
+	end
+
+	local function applyGod(state: PlayerState, character: Model, enabled: boolean)
+		if state.godConnection then
+			state.godConnection:Disconnect()
+			state.godConnection = nil
+		end
+		local old = character:FindFirstChild(FORCEFIELD_NAME)
+		if old then
+			old:Destroy()
+		end
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if not enabled or not humanoid then
+			return
+		end
+		local forceField = Instance.new("ForceField")
+		forceField.Name = FORCEFIELD_NAME
+		forceField.Visible = false
+		forceField.Parent = character
+		humanoid.Health = humanoid.MaxHealth
+		state.godConnection = humanoid.HealthChanged:Connect(function()
+			if humanoid.Health > 0 and humanoid.Health < humanoid.MaxHealth then
+				humanoid.Health = humanoid.MaxHealth
+			end
+		end)
+	end
+
+	local function applyMovement(state: PlayerState, humanoid: Humanoid)
+		if state.walkSpeed then
+			humanoid.WalkSpeed = state.walkSpeed
+		end
+		if state.jumpPower then
+			humanoid.UseJumpPower = true
+			humanoid.JumpPower = state.jumpPower
+		end
+	end
+
+	local function getWaypointFolder(): Folder?
+		local folder = Workspace:FindFirstChild(Config.WaypointFolderName)
+		if folder and folder:IsA("Folder") then
+			return folder
+		end
+		return nil
+	end
+
+	local function waypointPivot(waypoint: Instance): CFrame?
+		if waypoint:IsA("BasePart") then
+			return waypoint.CFrame * CFrame.new(0, waypoint.Size.Y / 2 + 3, 0)
+		elseif waypoint:IsA("Model") then
+			return waypoint:GetPivot() * CFrame.new(0, 3, 0)
+		end
+		return nil
+	end
+
+	local function findPlayer(query: any): Player?
+		if type(query) == "number" then
+			return Players:GetPlayerByUserId(query)
+		end
+		if type(query) ~= "string" or query == "" then
+			return nil
+		end
+		local lowered = string.lower(query)
+		local prefixMatch: Player? = nil
+		local prefixCount = 0
+		for _, candidate in Players:GetPlayers() do
+			local name = string.lower(candidate.Name)
+			if name == lowered then
+				return candidate
+			end
+			if string.sub(name, 1, #lowered) == lowered then
+				prefixMatch = candidate
+				prefixCount += 1
+			end
+		end
+		if prefixCount == 1 then
+			return prefixMatch
+		end
+		return nil
+	end
+
+	local function pivotCharacter(player: Player, target: CFrame): Reply
+		local character = player.Character
+		if not character then
+			return reply(false, "No character to move")
+		end
+		character:PivotTo(target)
+		return reply(true, "Teleported")
+	end
+
+	local handlers: { [string]: (Player, PlayerState, any) -> Reply } = {}
+
+	handlers.auth = function(_player, _state, _payload)
+		return reply(true, "Authorized")
+	end
+
+	handlers.god = function(player, state, payload)
+		if type(payload) ~= "boolean" then
+			return reply(false, "god expects a boolean")
+		end
+		state.god = payload
+		if player.Character then
+			applyGod(state, player.Character, payload)
+		end
+		return reply(true, payload and "God mode ON" or "God mode OFF")
+	end
+
+	handlers.speed = function(player, state, payload)
+		if not Util.isInRange(payload, 0, Config.Limits.MaxWalkSpeed) then
+			return reply(false, string.format("Speed must be 0..%d", Config.Limits.MaxWalkSpeed))
+		end
+		state.walkSpeed = payload
+		local humanoid = getHumanoid(player)
+		if humanoid then
+			applyMovement(state, humanoid)
+		end
+		return reply(true, string.format("WalkSpeed = %.1f", payload))
+	end
+
+	handlers.jump = function(player, state, payload)
+		if not Util.isInRange(payload, 0, Config.Limits.MaxJumpPower) then
+			return reply(false, string.format("Jump power must be 0..%d", Config.Limits.MaxJumpPower))
+		end
+		state.jumpPower = payload
+		local humanoid = getHumanoid(player)
+		if humanoid then
+			applyMovement(state, humanoid)
+		end
+		return reply(true, string.format("JumpPower = %.1f", payload))
+	end
+
+	handlers.resetMovement = function(player, state, _payload)
+		state.walkSpeed = nil
+		state.jumpPower = nil
+		local humanoid = getHumanoid(player)
+		if humanoid then
+			humanoid.WalkSpeed = Config.Defaults.WalkSpeed
+			humanoid.UseJumpPower = true
+			humanoid.JumpPower = Config.Defaults.JumpPower
+		end
+		return reply(true, "Movement reset to defaults")
+	end
+
+	handlers.teleport = function(player, _state, payload)
+		local limit = Config.Limits.MaxCoordinate
+		if
+			type(payload) ~= "table"
+			or not Util.isInRange(payload.x, -limit, limit)
+			or not Util.isInRange(payload.y, -limit, limit)
+			or not Util.isInRange(payload.z, -limit, limit)
+		then
+			return reply(false, string.format("Coordinates must be finite and within +-%d", limit))
+		end
+		return pivotCharacter(player, CFrame.new(payload.x, payload.y, payload.z))
+	end
+
+	handlers.teleportToPlayer = function(player, _state, payload)
+		local target = findPlayer(payload)
+		if not target or target == player then
+			return reply(false, "No unique matching player (or that is you)")
+		end
+		local targetCharacter = target.Character
+		if not targetCharacter then
+			return reply(false, target.Name .. " has no character")
+		end
+		return pivotCharacter(player, targetCharacter:GetPivot() * CFrame.new(3, 0, 0))
+	end
+
+	handlers.listWaypoints = function(_player, _state, _payload)
+		local names: { string } = {}
+		local folder = getWaypointFolder()
+		if folder then
+			for _, child in folder:GetChildren() do
+				if waypointPivot(child) then
+					table.insert(names, child.Name)
+				end
+			end
+			table.sort(names)
+		end
+		return reply(true, string.format("%d waypoint(s)", #names), names)
+	end
+
+	handlers.teleportToWaypoint = function(player, _state, payload)
+		if type(payload) ~= "string" or payload == "" then
+			return reply(false, "Waypoint name expected")
+		end
+		local folder = getWaypointFolder()
+		local waypoint = folder and folder:FindFirstChild(payload)
+		local pivot = waypoint and waypointPivot(waypoint)
+		if not pivot then
+			return reply(false, "Waypoint not found: " .. payload)
+		end
+		return pivotCharacter(player, pivot)
+	end
+
+	local request = Instance.new("RemoteFunction")
+	request.Name = "DevToolsRequest"
+
+	request.OnServerInvoke = function(player: Player, action: any, payload: any): Reply
+		if not isAuthorized(player) then
+			return reply(false, "Not authorized")
+		end
+		if type(action) ~= "string" then
+			return reply(false, "Bad request")
+		end
+		local handler = handlers[action]
+		if not handler then
+			return reply(false, "Unknown action")
+		end
+		local state = getState(player)
+		if not allowRequest(state) then
+			return reply(false, "Rate limited")
+		end
+		if action ~= "auth" and action ~= "listWaypoints" then
+			print(string.format("[DevTools] %s (%d): %s", player.Name, player.UserId, action))
+		end
+		local ok, result = pcall(handler, player, state, payload)
+		if not ok then
+			warn("[DevTools] handler '" .. action .. "' failed: " .. tostring(result))
+			return reply(false, "Internal error")
+		end
+		return result
+	end
+
+	local function onCharacterAdded(player: Player, character: Model)
+		local state = states[player]
+		if not state then
+			return
+		end
+		local humanoid = character:WaitForChild("Humanoid", 10)
+		if not humanoid or not humanoid:IsA("Humanoid") then
+			return
+		end
+		applyMovement(state, humanoid)
+		applyGod(state, character, state.god)
+	end
+
+	local function onPlayerAdded(player: Player)
+		player.CharacterAdded:Connect(function(character)
+			onCharacterAdded(player, character)
+		end)
+	end
+
+	Players.PlayerAdded:Connect(onPlayerAdded)
+	for _, player in Players:GetPlayers() do
+		onPlayerAdded(player)
+	end
+
+	Players.PlayerRemoving:Connect(function(player)
+		local state = states[player]
+		if state and state.godConnection then
+			state.godConnection:Disconnect()
+		end
+		states[player] = nil
+	end)
+
+	-- Waypoint markers are debug aids: invisible, non-colliding, non-interactive while the game runs.
+	local waypointFolder = getWaypointFolder()
+	if waypointFolder then
+		for _, child in waypointFolder:GetChildren() do
+			if child:IsA("BasePart") then
+				child.Transparency = 1
+				child.CanCollide = false
+				child.CanTouch = false
+				child.CanQuery = false
+			end
+		end
+	end
+
+	request.Parent = ReplicatedStorage
+
+	-- Same file, client half: clone this Script with RunContext = Client into StarterPlayerScripts.
+	local clientCopy = script:Clone()
+	clientCopy.RunContext = Enum.RunContext.Client
+	clientCopy.Parent = StarterPlayer:WaitForChild("StarterPlayerScripts")
+end
+
+------------------------------------------------------------------------ Client
+local function runClient()
+	local localPlayer = Players.LocalPlayer
+
+	-- The server only creates this remote when the runtime is active, so absence means "stay inert".
+	local remote = ReplicatedStorage:WaitForChild("DevToolsRequest", 8)
+	if not remote or not remote:IsA("RemoteFunction") then
+		return
+	end
+
+	local function call(action: string, payload: any?): (boolean, string, any?)
+		local invoked, result = pcall(function()
+			return remote:InvokeServer(action, payload)
+		end)
+		if not invoked or type(result) ~= "table" then
+			return false, "Request failed", nil
+		end
+		return result.ok == true, tostring(result.message), result.data
+	end
+
+	if not (call("auth")) then
+		return
+	end
+
+	--------------------------------------------------------------------------- UI
+
+	local BG = Color3.fromRGB(24, 26, 32)
+	local PANEL = Color3.fromRGB(36, 39, 48)
+	local ACCENT = Color3.fromRGB(70, 130, 220)
+	local ON = Color3.fromRGB(60, 160, 90)
+	local TEXT = Color3.fromRGB(225, 228, 235)
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "DevToolsMenu"
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = 1000
+	gui.Enabled = false
+	gui.Parent = localPlayer:WaitForChild("PlayerGui")
+
+	local window = Instance.new("Frame")
+	window.Size = UDim2.fromOffset(340, 480)
+	window.Position = UDim2.fromOffset(16, 80)
+	window.BackgroundColor3 = BG
+	window.BorderSizePixel = 0
+	window.Parent = gui
+
+	local titleBar = Instance.new("TextLabel")
+	titleBar.Size = UDim2.new(1, 0, 0, 28)
+	titleBar.BackgroundColor3 = ACCENT
+	titleBar.BorderSizePixel = 0
+	titleBar.Text = "  Dev Tools  (" .. Config.ToggleKey.Name .. " to hide)"
+	titleBar.TextColor3 = Color3.new(1, 1, 1)
+	titleBar.TextXAlignment = Enum.TextXAlignment.Left
+	titleBar.Font = Enum.Font.GothamBold
+	titleBar.TextSize = 14
+	titleBar.Active = true
+	titleBar.Parent = window
+
+	local hud = Instance.new("TextLabel")
+	hud.Position = UDim2.fromOffset(0, 28)
+	hud.Size = UDim2.new(1, 0, 0, 84)
+	hud.BackgroundColor3 = PANEL
+	hud.BorderSizePixel = 0
+	hud.TextColor3 = TEXT
+	hud.TextXAlignment = Enum.TextXAlignment.Left
+	hud.TextYAlignment = Enum.TextYAlignment.Top
+	hud.Font = Enum.Font.Code
+	hud.TextSize = 13
+	hud.Text = ""
+	hud.Parent = window
+
+	local status = Instance.new("TextLabel")
+	status.AnchorPoint = Vector2.new(0, 1)
+	status.Position = UDim2.new(0, 0, 1, 0)
+	status.Size = UDim2.new(1, 0, 0, 24)
+	status.BackgroundColor3 = PANEL
+	status.BorderSizePixel = 0
+	status.TextColor3 = TEXT
+	status.TextXAlignment = Enum.TextXAlignment.Left
+	status.Font = Enum.Font.Gotham
+	status.TextSize = 13
+	status.Text = "  Ready"
+	status.Parent = window
+
+	local content = Instance.new("ScrollingFrame")
+	content.Position = UDim2.fromOffset(0, 116)
+	content.Size = UDim2.new(1, 0, 1, -144)
+	content.BackgroundTransparency = 1
+	content.BorderSizePixel = 0
+	content.ScrollBarThickness = 6
+	content.CanvasSize = UDim2.new()
+	content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	content.Parent = window
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 6)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = content
+
+	local padding = Instance.new("UIPadding")
+	padding.PaddingLeft = UDim.new(0, 8)
+	padding.PaddingRight = UDim.new(0, 14)
+	padding.PaddingTop = UDim.new(0, 4)
+	padding.Parent = content
+
+	local nextOrder = 0
+	local function order(): number
+		nextOrder += 1
+		return nextOrder
+	end
+
+	local function setStatus(ok: boolean, message: string)
+		status.Text = (ok and "  OK: " or "  ERR: ") .. message
+		status.TextColor3 = ok and Color3.fromRGB(130, 220, 150) or Color3.fromRGB(240, 130, 130)
+	end
+
+	local function makeButton(parent: Instance, text: string, size: UDim2, callback: () -> ()): TextButton
+		local button = Instance.new("TextButton")
+		button.Size = size
+		button.BackgroundColor3 = PANEL
+		button.BorderSizePixel = 0
+		button.TextColor3 = TEXT
+		button.Font = Enum.Font.Gotham
+		button.TextSize = 13
+		button.Text = text
+		button.AutoButtonColor = true
+		button.Parent = parent
+		button.Activated:Connect(callback)
+		return button
+	end
+
+	local function makeRow(): Frame
+		local row = Instance.new("Frame")
+		row.Size = UDim2.new(1, 0, 0, 28)
+		row.BackgroundTransparency = 1
+		row.LayoutOrder = order()
+		row.Parent = content
+		return row
+	end
+
+	local function makeToggle(text: string, onChange: (boolean) -> boolean): TextButton
+		local row = makeRow()
+		local value = false
+		local button: TextButton
+		local function refresh()
+			button.Text = text .. ": " .. (value and "ON" or "OFF")
+			button.BackgroundColor3 = value and ON or PANEL
+		end
+		button = makeButton(row, "", UDim2.fromScale(1, 1), function()
+			-- onChange returns the value that actually took effect (false if the server refused)
+			value = onChange(not value)
+			refresh()
+		end)
+		refresh()
+		return button
+	end
+
+	local function makeInputRow(label: string, placeholder: string, buttonText: string, onSubmit: (string) -> ()): TextBox
+		local row = makeRow()
+		local labelFrame = Instance.new("TextLabel")
+		labelFrame.Size = UDim2.new(0, 70, 1, 0)
+		labelFrame.BackgroundTransparency = 1
+		labelFrame.TextColor3 = TEXT
+		labelFrame.TextXAlignment = Enum.TextXAlignment.Left
+		labelFrame.Font = Enum.Font.Gotham
+		labelFrame.TextSize = 13
+		labelFrame.Text = label
+		labelFrame.Parent = row
+
+		local box = Instance.new("TextBox")
+		box.Position = UDim2.fromOffset(72, 0)
+		box.Size = UDim2.new(1, -72 - 64, 1, 0)
+		box.BackgroundColor3 = PANEL
+		box.BorderSizePixel = 0
+		box.TextColor3 = TEXT
+		box.PlaceholderText = placeholder
+		box.PlaceholderColor3 = Color3.fromRGB(130, 135, 148)
+		box.ClearTextOnFocus = false
+		box.Font = Enum.Font.Code
+		box.TextSize = 13
+		box.Text = ""
+		box.Parent = row
+
+		makeButton(row, buttonText, UDim2.new(0, 60, 1, 0), function()
+			onSubmit(box.Text)
+		end).Position = UDim2.new(1, -60, 0, 0)
+		box.FocusLost:Connect(function(enterPressed)
+			if enterPressed then
+				onSubmit(box.Text)
+			end
+		end)
+		return box
+	end
+
+	-- Dragging by the title bar
+	do
+		local dragStart: Vector3? = nil
+		local windowStart = window.Position
+		titleBar.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				dragStart = input.Position
+				windowStart = window.Position
+			end
+		end)
+		UserInputService.InputChanged:Connect(function(input)
+			if dragStart and input.UserInputType == Enum.UserInputType.MouseMovement then
+				local delta = input.Position - dragStart
+				window.Position = UDim2.fromOffset(windowStart.X.Offset + delta.X, windowStart.Y.Offset + delta.Y)
+			end
+		end)
+		UserInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				dragStart = nil
+			end
+		end)
+	end
+
+	------------------------------------------------------------ local movement tools
+
+	local function getRoot(): BasePart?
+		local character = localPlayer.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if root and root:IsA("BasePart") then
+			return root
+		end
+		return nil
+	end
+
+	local noclipConnection: RBXScriptConnection? = nil
+	local function setNoclip(enabled: boolean)
+		if noclipConnection then
+			noclipConnection:Disconnect()
+			noclipConnection = nil
+		end
+		if not enabled then
+			return
+		end
+		noclipConnection = RunService.Stepped:Connect(function()
+			local character = localPlayer.Character
+			if not character then
+				return
+			end
+			for _, descendant in character:GetDescendants() do
+				if descendant:IsA("BasePart") then
+					descendant.CanCollide = false
+				end
+			end
+		end)
+	end
+
+	local flyConnection: RBXScriptConnection? = nil
+	local function setFly(enabled: boolean)
+		if flyConnection then
+			flyConnection:Disconnect()
+			flyConnection = nil
+		end
+		local character = localPlayer.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if not enabled then
+			if humanoid then
+				humanoid.PlatformStand = false
+			end
+			local root = getRoot()
+			if root then
+				root.AssemblyLinearVelocity = Vector3.zero
+			end
+			return
+		end
+		if humanoid then
+			humanoid.PlatformStand = true
+		end
+		flyConnection = RunService.RenderStepped:Connect(function()
+			local root = getRoot()
+			local camera = Workspace.CurrentCamera
+			if not root or not camera then
+				return
+			end
+			local direction = Vector3.zero
+			if UserInputService:GetFocusedTextBox() == nil then
+				local look = camera.CFrame.LookVector
+				local right = camera.CFrame.RightVector
+				if UserInputService:IsKeyDown(Enum.KeyCode.W) then direction += look end
+				if UserInputService:IsKeyDown(Enum.KeyCode.S) then direction -= look end
+				if UserInputService:IsKeyDown(Enum.KeyCode.D) then direction += right end
+				if UserInputService:IsKeyDown(Enum.KeyCode.A) then direction -= right end
+				if UserInputService:IsKeyDown(Enum.KeyCode.Space) then direction += Vector3.yAxis end
+				if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then direction -= Vector3.yAxis end
+			end
+			if direction.Magnitude > 0 then
+				direction = direction.Unit * Config.FlySpeed
+			end
+			root.AssemblyLinearVelocity = direction
+		end)
+	end
+
+	------------------------------------------------------------------ menu contents
+
+	makeToggle("God mode", function(want)
+		local ok, message = call("god", want)
+		setStatus(ok, message)
+		if ok then
+			return want
+		end
+		return not want
+	end)
+
+	makeToggle("Noclip (local)", function(want)
+		setNoclip(want)
+		setStatus(true, want and "Noclip ON (you fall through floors unless Fly is on)" or "Noclip OFF")
+		return want
+	end)
+
+	makeToggle("Fly (WASD, Space/Ctrl)", function(want)
+		setFly(want)
+		setStatus(true, want and "Fly ON" or "Fly OFF")
+		return want
+	end)
+
+	makeInputRow("WalkSpeed", "e.g. 50", "Set", function(text)
+		local value = tonumber(text)
+		if value == nil then
+			setStatus(false, "Enter a number")
+			return
+		end
+		setStatus(call("speed", value))
+	end)
+
+	makeInputRow("JumpPower", "e.g. 100", "Set", function(text)
+		local value = tonumber(text)
+		if value == nil then
+			setStatus(false, "Enter a number")
+			return
+		end
+		setStatus(call("jump", value))
+	end)
+
+	do
+		local row = makeRow()
+		makeButton(row, "Reset speed / jump", UDim2.fromScale(1, 1), function()
+			setStatus(call("resetMovement"))
+		end)
+	end
+
+	local coordsBox: TextBox
+	coordsBox = makeInputRow("Teleport", "x y z", "Go", function(text)
+		local vec = Util.parseVec3(text)
+		if not vec then
+			setStatus(false, "Expected three numbers: x y z")
+			return
+		end
+		setStatus(call("teleport", vec))
+	end)
+
+	do
+		local row = makeRow()
+		makeButton(row, "Fill with my current position", UDim2.fromScale(1, 1), function()
+			local root = getRoot()
+			if not root then
+				setStatus(false, "No character")
+				return
+			end
+			local p = root.Position
+			coordsBox.Text = Util.formatVec3(p.X, p.Y, p.Z)
+			setStatus(true, "Position copied into the box")
+		end)
+	end
+
+	makeInputRow("To player", "name or prefix", "Go", function(text)
+		setStatus(call("teleportToPlayer", Util.trim(text)))
+	end)
+
+	local waypointHeader = Instance.new("TextLabel")
+	waypointHeader.Size = UDim2.new(1, 0, 0, 20)
+	waypointHeader.BackgroundTransparency = 1
+	waypointHeader.TextColor3 = TEXT
+	waypointHeader.TextXAlignment = Enum.TextXAlignment.Left
+	waypointHeader.Font = Enum.Font.GothamBold
+	waypointHeader.TextSize = 13
+	waypointHeader.Text = "Waypoints (" .. Config.WaypointFolderName .. ")"
+	waypointHeader.LayoutOrder = order()
+	waypointHeader.Parent = content
+
+	local waypointList = Instance.new("Frame")
+	waypointList.Size = UDim2.new(1, 0, 0, 0)
+	waypointList.AutomaticSize = Enum.AutomaticSize.Y
+	waypointList.BackgroundTransparency = 1
+	waypointList.LayoutOrder = order()
+	waypointList.Parent = content
+	local waypointLayout = Instance.new("UIListLayout")
+	waypointLayout.Padding = UDim.new(0, 4)
+	waypointLayout.Parent = waypointList
+
+	local function refreshWaypoints()
+		for _, child in waypointList:GetChildren() do
+			if child:IsA("TextButton") then
+				child:Destroy()
+			end
+		end
+		local ok, message, names = call("listWaypoints")
+		setStatus(ok, message)
+		if ok and type(names) == "table" then
+			for _, name in names do
+				if type(name) == "string" then
+					makeButton(waypointList, name, UDim2.new(1, 0, 0, 26), function()
+						setStatus(call("teleportToWaypoint", name))
+					end)
+				end
+			end
+		end
+	end
+
+	do
+		local row = makeRow()
+		makeButton(row, "Refresh waypoint list", UDim2.fromScale(1, 1), refreshWaypoints)
+	end
+
+	------------------------------------------------------------------- HUD + toggle
+
+	local elapsed = 0
+	local frames = 0
+	RunService.RenderStepped:Connect(function(dt)
+		if not gui.Enabled then
+			return
+		end
+		elapsed += dt
+		frames += 1
+		if elapsed < 0.25 then
+			return
+		end
+		local fps = frames / elapsed
+		elapsed, frames = 0, 0
+
+		local pingOk, ping = pcall(function()
+			return (Stats :: any).Network.ServerStatsItem["Data Ping"]:GetValue()
+		end)
+		local lines = { string.format("FPS %.0f   Ping %s", fps, pingOk and string.format("%.0f ms", ping) or "n/a") }
+		local root = getRoot()
+		local character = localPlayer.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if root then
+			local p = root.Position
+			table.insert(lines, "Pos   " .. Util.formatVec3(p.X, p.Y, p.Z))
+			table.insert(lines, string.format("Speed %.1f studs/s", root.AssemblyLinearVelocity.Magnitude))
+		end
+		if humanoid then
+			table.insert(lines, string.format("HP %.0f/%.0f  WS %.0f  JP %.0f", humanoid.Health, humanoid.MaxHealth, humanoid.WalkSpeed, humanoid.JumpPower))
+			table.insert(lines, "State " .. humanoid:GetState().Name)
+		end
+		hud.Text = table.concat(lines, "\n")
+	end)
+
+	UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if gameProcessed then
+			return
+		end
+		if input.KeyCode == Config.ToggleKey then
+			gui.Enabled = not gui.Enabled
+			if gui.Enabled then
+				refreshWaypoints()
+			end
+		end
+	end)
+
+	-- Fly is tied to the Humanoid's PlatformStand, so re-apply it on the new character after a respawn.
+	localPlayer.CharacterAdded:Connect(function(character)
+		if flyConnection then
+			character:WaitForChild("Humanoid", 10)
+			setFly(true)
+		end
+	end)
+end
+
+if RunService:IsServer() then
+	runServer()
+else
+	runClient()
+end
