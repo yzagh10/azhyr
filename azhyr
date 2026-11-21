@@ -1,894 +1,1598 @@
---!strict
--- DevTools (single file). Debug menu for YOUR OWN experience: god mode, speed, jump, teleport
--- (coordinates / player / waypoint), noclip, fly, live HUD.
---
--- INSTALL: insert a normal *Script* (not LocalScript) in ServerScriptService and paste this whole file.
--- Press F4 in a playtest. In Studio everyone is allowed; in a published server only Config.AllowedUserIds.
--- Waypoints: parts inside Workspace.DevWaypoints (the Studio plugin creates them, or make them by hand).
--- How it works: the server half validates every action; it then clones this same Script with
--- RunContext = Client into StarterPlayerScripts, and that copy runs the menu half.
+--=============================================================
+--  AURORA UI — arquivo único
+--  LocalScript -> StarterPlayer > StarterPlayerScripts
+--=============================================================
 
 local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-local StarterPlayer = game:GetService("StarterPlayer")
+local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
-local Stats = game:GetService("Stats")
-local Workspace = game:GetService("Workspace")
 
------------------------------------------------------------------------- Config
--- Shared settings for the DevTools runtime (server and client both read this).
-local Config = {
-	-- In Roblox Studio (Play Solo / Team Test) every player is authorized.
-	StudioAlwaysAllowed = true,
-	-- UserIds allowed in a published server. Empty + not in Studio = the runtime stays inert
-	-- and does not even create its RemoteFunction.
-	AllowedUserIds = {} :: { number },
+local LocalPlayer = Players.LocalPlayer
 
-	ToggleKey = Enum.KeyCode.F4,
-	WaypointFolderName = "DevWaypoints", -- Workspace folder filled by the Studio plugin
-	RequestsPerSecond = 20,
-	FlySpeed = 60, -- studs per second
+--=============================================================
+-- TEMA
+--=============================================================
 
-	Limits = {
-		MaxWalkSpeed = 300,
-		MaxJumpPower = 500,
-		MaxCoordinate = 100000,
-	},
-	Defaults = {
-		WalkSpeed = 16,
-		JumpPower = 50,
-	},
+local Theme = {
+	Bg           = Color3.fromRGB(15, 15, 20),
+	Panel        = Color3.fromRGB(23, 23, 30),
+	Sidebar      = Color3.fromRGB(19, 19, 25),
+	Element      = Color3.fromRGB(31, 31, 40),
+	ElementHover = Color3.fromRGB(39, 39, 50),
+	Accent       = Color3.fromRGB(139, 92, 246),
+	Text         = Color3.fromRGB(235, 235, 244),
+	TextDim      = Color3.fromRGB(136, 136, 158),
+	Stroke       = Color3.fromRGB(48, 48, 61),
+	Success      = Color3.fromRGB(52, 199, 123),
+	Danger       = Color3.fromRGB(233, 69, 96),
+	White        = Color3.fromRGB(255, 255, 255),
 }
 
-------------------------------------------------------------------------- Util
--- Pure helpers with no Roblox dependencies, so they can be checked with the plain Luau CLI.
-local Util = {}
+local accentHooks = {}
 
-export type Vec3 = { x: number, y: number, z: number }
-
-function Util.isFiniteNumber(value: any): boolean
-	return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
+local function onAccent(fn)
+	table.insert(accentHooks, fn)
+	fn(Theme.Accent)
 end
 
-function Util.isInRange(value: any, minimum: number, maximum: number): boolean
-	return Util.isFiniteNumber(value) and value >= minimum and value <= maximum
+local function setAccent(color)
+	Theme.Accent = color
+	for _, fn in ipairs(accentHooks) do
+		fn(color)
+	end
 end
 
--- Accepts "x y z", "x, y, z" or "x;y;z". Returns nil unless there are exactly three finite numbers.
-function Util.parseVec3(text: string): Vec3?
-	local numbers: { number } = {}
-	for token in string.gmatch(text, "[^%s,;]+") do
-		local n = tonumber(token)
-		if n == nil or not Util.isFiniteNumber(n) then
-			return nil
+--=============================================================
+-- HELPERS
+--=============================================================
+
+local function new(class, props)
+	local inst = Instance.new(class)
+	if props then
+		for key, value in pairs(props) do
+			if key ~= "Parent" then
+				inst[key] = value
+			end
 		end
-		table.insert(numbers, n)
+		if props.Parent then
+			inst.Parent = props.Parent
+		end
 	end
-	if #numbers ~= 3 then
-		return nil
-	end
-	return { x = numbers[1], y = numbers[2], z = numbers[3] }
+	return inst
 end
 
-function Util.formatVec3(x: number, y: number, z: number): string
-	return string.format("%.2f, %.2f, %.2f", x, y, z)
+local function tween(inst, duration, props, style, direction)
+	local info = TweenInfo.new(
+		duration or 0.2,
+		style or Enum.EasingStyle.Quad,
+		direction or Enum.EasingDirection.Out
+	)
+	local track = TweenService:Create(inst, info, props)
+	track:Play()
+	return track
 end
 
-function Util.trim(text: string): string
-	return (string.gsub(text, "^%s*(.-)%s*$", "%1"))
+local function corner(parent, radius)
+	return new("UICorner", { CornerRadius = UDim.new(0, radius or 8), Parent = parent })
 end
 
------------------------------------------------------------------------- Server
-local function runServer()
-	local inStudioAllowed = Config.StudioAlwaysAllowed and RunService:IsStudio()
-	if not inStudioAllowed and #Config.AllowedUserIds == 0 then
-		-- Live server and nobody allow-listed: expose nothing.
-		return
+local function stroke(parent, color, thickness, transparency)
+	return new("UIStroke", {
+		Color = color or Theme.Stroke,
+		Thickness = thickness or 1,
+		Transparency = transparency or 0,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		Parent = parent,
+	})
+end
+
+local function pad(parent, top, right, bottom, left)
+	return new("UIPadding", {
+		PaddingTop = UDim.new(0, top or 0),
+		PaddingRight = UDim.new(0, right or 0),
+		PaddingBottom = UDim.new(0, bottom or 0),
+		PaddingLeft = UDim.new(0, left or 0),
+		Parent = parent,
+	})
+end
+
+--=============================================================
+-- RAIZ
+--=============================================================
+
+local guiParent = LocalPlayer:WaitForChild("PlayerGui")
+if typeof(gethui) == "function" then
+	local ok, result = pcall(gethui)
+	if ok and typeof(result) == "Instance" then
+		guiParent = result
+	end
+end
+
+local gui = new("ScreenGui", {
+	Name = "AuroraUI",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	DisplayOrder = 200,
+	Parent = guiParent,
+})
+
+--=============================================================
+-- NOTIFICAÇÕES
+--=============================================================
+
+local CARD_W, CARD_H, CARD_GAP = 296, 64, 8
+
+local notifHolder = new("Frame", {
+	Name = "Notifications",
+	AnchorPoint = Vector2.new(1, 1),
+	Position = UDim2.new(1, -18, 1, -18),
+	Size = UDim2.new(0, CARD_W, 0, 480),
+	BackgroundTransparency = 1,
+	Parent = gui,
+})
+
+local notifStack = {}
+
+local function relayoutNotifications()
+	for i = 2, #notifStack do
+		tween(notifStack[i], 0.25, {
+			Position = UDim2.new(1, 0, 1, -((i - 1) * (CARD_H + CARD_GAP))),
+		}, Enum.EasingStyle.Quint)
+	end
+end
+
+local function notify(opts)
+	opts = opts or {}
+	local accent = opts.Color or Theme.Accent
+	local duration = opts.Duration or 4
+
+	local card = new("CanvasGroup", {
+		Name = "Card",
+		AnchorPoint = Vector2.new(1, 1),
+		Position = UDim2.new(1, 340, 1, 0),
+		Size = UDim2.new(0, CARD_W, 0, CARD_H),
+		BackgroundColor3 = Theme.Panel,
+		GroupTransparency = 1,
+		Parent = notifHolder,
+	})
+	corner(card, 10)
+	stroke(card, Theme.Stroke, 1, 0.2)
+
+	local bar = new("Frame", {
+		Size = UDim2.new(0, 3, 1, -20),
+		Position = UDim2.new(0, 0, 0, 10),
+		BackgroundColor3 = accent,
+		Parent = card,
+	})
+	corner(bar, 2)
+
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 16, 0, 12),
+		Size = UDim2.new(1, -28, 0, 16),
+		Font = Enum.Font.GothamBold,
+		Text = opts.Title or "Notificação",
+		TextColor3 = Theme.Text,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = card,
+	})
+
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 16, 0, 32),
+		Size = UDim2.new(1, -28, 0, 22),
+		Font = Enum.Font.Gotham,
+		Text = opts.Text or "",
+		TextColor3 = Theme.TextDim,
+		TextSize = 12,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		Parent = card,
+	})
+
+	table.insert(notifStack, 1, card)
+	relayoutNotifications()
+
+	tween(card, 0.35, {
+		Position = UDim2.new(1, 0, 1, 0),
+		GroupTransparency = 0,
+	}, Enum.EasingStyle.Quint)
+
+	task.delay(duration, function()
+		if not card.Parent then
+			return
+		end
+		tween(card, 0.25, {
+			Position = UDim2.new(1, 340, 1, card.Position.Y.Offset),
+			GroupTransparency = 1,
+		}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		task.wait(0.26)
+		local index = table.find(notifStack, card)
+		if index then
+			table.remove(notifStack, index)
+		end
+		card:Destroy()
+		relayoutNotifications()
+	end)
+
+	return card
+end
+
+--=============================================================
+-- ELEMENTOS
+--=============================================================
+
+local function createToggle(body, order, opts)
+	opts = opts or {}
+	local state = opts.Default == true
+
+	local row = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 36),
+		BackgroundColor3 = Theme.Element,
+		Text = "",
+		AutoButtonColor = false,
+		LayoutOrder = order,
+		Parent = body,
+	})
+	corner(row, 8)
+	stroke(row, Theme.Stroke, 1, 0.55)
+
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 12, 0, 0),
+		Size = UDim2.new(1, -80, 1, 0),
+		Font = Enum.Font.GothamMedium,
+		Text = opts.Name or "Toggle",
+		TextColor3 = Theme.Text,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = row,
+	})
+
+	local pill = new("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -12, 0.5, 0),
+		Size = UDim2.new(0, 36, 0, 20),
+		BackgroundColor3 = Theme.ElementHover,
+		Parent = row,
+	})
+	corner(pill, 10)
+
+	local knob = new("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 3, 0.5, 0),
+		Size = UDim2.new(0, 14, 0, 14),
+		BackgroundColor3 = Theme.White,
+		Parent = pill,
+	})
+	corner(knob, 7)
+
+	local function render(animated)
+		local goal = UDim2.new(0, state and 19 or 3, 0.5, 0)
+		local color = state and Theme.Accent or Theme.ElementHover
+		if animated then
+			tween(knob, 0.2, { Position = goal }, Enum.EasingStyle.Quint)
+			tween(pill, 0.2, { BackgroundColor3 = color })
+		else
+			knob.Position = goal
+			pill.BackgroundColor3 = color
+		end
 	end
 
-	type PlayerState = {
-		god: boolean,
-		walkSpeed: number?,
-		jumpPower: number?,
-		godConnection: RBXScriptConnection?,
-		recentRequests: { number },
+	onAccent(function(color)
+		if state then
+			pill.BackgroundColor3 = color
+		end
+	end)
+
+	local function set(value, silent)
+		state = value == true
+		render(true)
+		if not silent and opts.Callback then
+			task.spawn(opts.Callback, state)
+		end
+	end
+
+	row.Activated:Connect(function()
+		set(not state)
+	end)
+	row.MouseEnter:Connect(function()
+		tween(row, 0.15, { BackgroundColor3 = Theme.ElementHover })
+	end)
+	row.MouseLeave:Connect(function()
+		tween(row, 0.15, { BackgroundColor3 = Theme.Element })
+	end)
+
+	render(false)
+	return { Set = set, Get = function() return state end, Row = row }
+end
+
+local function createSlider(body, order, opts)
+	opts = opts or {}
+	local minValue = opts.Min or 0
+	local maxValue = opts.Max or 100
+	local step = opts.Step or 1
+	local value = math.clamp(opts.Default or minValue, minValue, maxValue)
+
+	local row = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 36),
+		BackgroundColor3 = Theme.Element,
+		LayoutOrder = order,
+		Parent = body,
+	})
+	corner(row, 8)
+	stroke(row, Theme.Stroke, 1, 0.55)
+
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 12, 0, 0),
+		Size = UDim2.new(1, -200, 1, 0),
+		Font = Enum.Font.GothamMedium,
+		Text = opts.Name or "Slider",
+		TextColor3 = Theme.Text,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = row,
+	})
+
+	local valueLabel = new("TextLabel", {
+		BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -144, 0.5, 0),
+		Size = UDim2.new(0, 52, 0, 36),
+		Font = Enum.Font.GothamBold,
+		Text = "",
+		TextColor3 = Theme.TextDim,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Parent = row,
+	})
+
+	local track = new("TextButton", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -12, 0.5, 0),
+		Size = UDim2.new(0, 120, 0, 6),
+		BackgroundColor3 = Theme.Bg,
+		Text = "",
+		AutoButtonColor = false,
+		Parent = row,
+	})
+	corner(track, 3)
+
+	local fill = new("Frame", {
+		Size = UDim2.new(0, 0, 1, 0),
+		BackgroundColor3 = Theme.Accent,
+		BorderSizePixel = 0,
+		ZIndex = 1,
+		Parent = track,
+	})
+	corner(fill, 3)
+	onAccent(function(color)
+		fill.BackgroundColor3 = color
+	end)
+
+	local knob = new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0, 0, 0.5, 0),
+		Size = UDim2.new(0, 12, 0, 12),
+		BackgroundColor3 = Theme.White,
+		ZIndex = 2,
+		Parent = track,
+	})
+	corner(knob, 6)
+	local ring = stroke(knob, Theme.Accent, 2, 0)
+	onAccent(function(color)
+		ring.Color = color
+	end)
+
+	local function formatValue(v)
+		if step >= 1 then
+			return tostring(math.floor(v + 0.5)) .. (opts.Suffix or "")
+		end
+		return string.format("%.2f", v) .. (opts.Suffix or "")
+	end
+
+	local function setValue(v, silent)
+		value = math.clamp(v, minValue, maxValue)
+		local alpha = (value - minValue) / math.max(maxValue - minValue, 1e-6)
+		fill.Size = UDim2.new(alpha, 0, 1, 0)
+		knob.Position = UDim2.new(alpha, 0, 0.5, 0)
+		valueLabel.Text = formatValue(value)
+		if not silent and opts.Callback then
+			task.spawn(opts.Callback, value)
+		end
+	end
+
+	local function setFromX(x)
+		local relative = (x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1)
+		relative = math.clamp(relative, 0, 1)
+		local raw = minValue + (maxValue - minValue) * relative
+		if step > 0 then
+			raw = math.floor(raw / step + 0.5) * step
+		end
+		setValue(raw)
+	end
+
+	local dragging = false
+
+	track.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			setFromX(input.Position.X)
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if not dragging then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch then
+			setFromX(input.Position.X)
+		end
+	end)
+
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	setValue(value, true)
+	return { Set = function(v) setValue(v) end, Get = function() return value end }
+end
+
+local function createDropdown(body, order, opts)
+	opts = opts or {}
+	local items = opts.Options or {}
+	local selected = opts.Default or items[1]
+	local expanded = false
+
+	local holder = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 36),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		LayoutOrder = order,
+		Parent = body,
+	})
+	new("UIListLayout", {
+		Padding = UDim.new(0, 6),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Parent = holder,
+	})
+
+	local header = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 36),
+		BackgroundColor3 = Theme.Element,
+		Text = "",
+		AutoButtonColor = false,
+		LayoutOrder = 1,
+		Parent = holder,
+	})
+	corner(header, 8)
+	stroke(header, Theme.Stroke, 1, 0.55)
+
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 12, 0, 0),
+		Size = UDim2.new(1, -170, 1, 0),
+		Font = Enum.Font.GothamMedium,
+		Text = opts.Name or "Dropdown",
+		TextColor3 = Theme.Text,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = header,
+	})
+
+	local valueLabel = new("TextLabel", {
+		BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -34, 0.5, 0),
+		Size = UDim2.new(0, 150, 0, 36),
+		Font = Enum.Font.GothamBold,
+		Text = "",
+		TextColor3 = Theme.TextDim,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Parent = header,
+	})
+
+	local chevron = new("TextLabel", {
+		BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -12, 0.5, 0),
+		Size = UDim2.new(0, 14, 0, 14),
+		Font = Enum.Font.GothamBold,
+		Text = "⌄",
+		TextColor3 = Theme.TextDim,
+		TextSize = 13,
+		Parent = header,
+	})
+
+	local list = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		BackgroundColor3 = Theme.Panel,
+		ClipsDescendants = true,
+		LayoutOrder = 2,
+		Parent = holder,
+	})
+	corner(list, 8)
+	stroke(list, Theme.Stroke, 1, 0.4)
+	pad(list, 4, 4, 4, 4)
+	new("UIListLayout", {
+		Padding = UDim.new(0, 2),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Parent = list,
+	})
+
+	local entries = {}
+
+	local function refresh()
+		for _, entry in ipairs(entries) do
+			local isSelected = entry.Item == selected
+			entry.Button.BackgroundTransparency = isSelected and 0 or 1
+			entry.Dot.BackgroundTransparency = isSelected and 0 or 1
+			entry.Label.TextColor3 = isSelected and Theme.Text or Theme.TextDim
+		end
+		valueLabel.Text = tostring(selected or "—")
+	end
+
+	local function toggleList(open)
+		if open == nil then
+			expanded = not expanded
+		else
+			expanded = open
+		end
+		local target = expanded and (#items * 28 + 8) or 0
+		tween(list, 0.22, { Size = UDim2.new(1, 0, 0, target) }, Enum.EasingStyle.Quint)
+		tween(chevron, 0.22, { Rotation = expanded and 180 or 0 })
+	end
+
+	for index, item in ipairs(items) do
+		local option = new("TextButton", {
+			Size = UDim2.new(1, 0, 0, 26),
+			BackgroundColor3 = Theme.ElementHover,
+			BackgroundTransparency = 1,
+			Text = "",
+			AutoButtonColor = false,
+			LayoutOrder = index,
+			Parent = list,
+		})
+		corner(option, 6)
+
+		local dotMark = new("Frame", {
+			Size = UDim2.new(0, 4, 0, 4),
+			Position = UDim2.new(0, 10, 0.5, -2),
+			BackgroundColor3 = Theme.Accent,
+			BackgroundTransparency = 1,
+			Parent = option,
+		})
+		corner(dotMark, 2)
+		onAccent(function(color)
+			dotMark.BackgroundColor3 = color
+		end)
+
+		local label = new("TextLabel", {
+			BackgroundTransparency = 1,
+			Position = UDim2.new(0, 20, 0, 0),
+			Size = UDim2.new(1, -26, 1, 0),
+			Font = Enum.Font.Gotham,
+			Text = tostring(item),
+			TextColor3 = Theme.TextDim,
+			TextSize = 12,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Parent = option,
+		})
+
+		option.MouseEnter:Connect(function()
+			if item ~= selected then
+				option.BackgroundTransparency = 0.5
+			end
+		end)
+		option.MouseLeave:Connect(function()
+			if item ~= selected then
+				option.BackgroundTransparency = 1
+			end
+		end)
+		option.Activated:Connect(function()
+			selected = item
+			refresh()
+			if opts.Callback then
+				task.spawn(opts.Callback, item)
+			end
+			toggleList(false)
+		end)
+
+		table.insert(entries, { Item = item, Button = option, Dot = dotMark, Label = label })
+	end
+
+	header.Activated:Connect(function()
+		toggleList()
+	end)
+	header.MouseEnter:Connect(function()
+		tween(header, 0.15, { BackgroundColor3 = Theme.ElementHover })
+	end)
+	header.MouseLeave:Connect(function()
+		tween(header, 0.15, { BackgroundColor3 = Theme.Element })
+	end)
+
+	refresh()
+	return {
+		Get = function() return selected end,
+		Set = function(item) selected = item; refresh() end,
+	}
+end
+
+local function createKeybind(body, order, opts)
+	opts = opts or {}
+	local key = opts.Default or Enum.KeyCode.Unknown
+	local listening = false
+	local connection
+
+	local row = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 36),
+		BackgroundColor3 = Theme.Element,
+		Text = "",
+		AutoButtonColor = false,
+		LayoutOrder = order,
+		Parent = body,
+	})
+	corner(row, 8)
+	stroke(row, Theme.Stroke, 1, 0.55)
+
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 12, 0, 0),
+		Size = UDim2.new(1, -120, 1, 0),
+		Font = Enum.Font.GothamMedium,
+		Text = opts.Name or "Keybind",
+		TextColor3 = Theme.Text,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = row,
+	})
+
+	local button = new("TextButton", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -12, 0.5, 0),
+		Size = UDim2.new(0, 92, 0, 24),
+		BackgroundColor3 = Theme.ElementHover,
+		Text = "",
+		AutoButtonColor = false,
+		Parent = row,
+	})
+	corner(button, 6)
+
+	local buttonLabel = new("TextLabel", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 1, 0),
+		Font = Enum.Font.GothamBold,
+		Text = "",
+		TextColor3 = Theme.Text,
+		TextSize = 11,
+		Parent = button,
+	})
+
+	local function render()
+		if key == Enum.KeyCode.Unknown then
+			buttonLabel.Text = "—"
+		else
+			buttonLabel.Text = key.Name
+		end
+	end
+
+	local function stopListening()
+		listening = false
+		if connection then
+			connection:Disconnect()
+			connection = nil
+		end
+		buttonLabel.TextColor3 = Theme.Text
+		button.BackgroundColor3 = Theme.ElementHover
+		render()
+	end
+
+	local function startListening()
+		if listening then
+			stopListening()
+			return
+		end
+		listening = true
+		buttonLabel.Text = "tecla..."
+		buttonLabel.TextColor3 = Theme.Accent
+		button.BackgroundColor3 = Theme.Element
+		connection = UserInputService.InputBegan:Connect(function(input, processed)
+			if processed then
+				return
+			end
+			if input.UserInputType ~= Enum.UserInputType.Keyboard then
+				return
+			end
+			if input.KeyCode == Enum.KeyCode.Escape then
+				stopListening()
+				return
+			end
+			key = input.KeyCode
+			stopListening()
+			if opts.Callback then
+				task.spawn(opts.Callback, key)
+			end
+		end)
+	end
+
+	row.Activated:Connect(startListening)
+	button.Activated:Connect(startListening)
+	row.MouseEnter:Connect(function()
+		tween(row, 0.15, { BackgroundColor3 = Theme.ElementHover })
+	end)
+	row.MouseLeave:Connect(function()
+		tween(row, 0.15, { BackgroundColor3 = Theme.Element })
+	end)
+
+	render()
+	return { Get = function() return key end }
+end
+
+local function createTextbox(body, order, opts)
+	opts = opts or {}
+
+	local row = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 36),
+		BackgroundColor3 = Theme.Element,
+		LayoutOrder = order,
+		Parent = body,
+	})
+	corner(row, 8)
+	stroke(row, Theme.Stroke, 1, 0.55)
+
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 12, 0, 0),
+		Size = UDim2.new(1, -200, 1, 0),
+		Font = Enum.Font.GothamMedium,
+		Text = opts.Name or "Texto",
+		TextColor3 = Theme.Text,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = row,
+	})
+
+	local box = new("TextBox", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -12, 0.5, 0),
+		Size = UDim2.new(0, 160, 0, 24),
+		BackgroundColor3 = Theme.Bg,
+		Font = Enum.Font.Gotham,
+		Text = opts.Default or "",
+		PlaceholderText = opts.Placeholder or "digite...",
+		PlaceholderColor3 = Theme.TextDim,
+		TextColor3 = Theme.Text,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		ClearTextOnFocus = false,
+		Parent = row,
+	})
+	corner(box, 6)
+	pad(box, 0, 8, 0, 8)
+
+	box.FocusLost:Connect(function(enter)
+		if opts.Callback then
+			task.spawn(opts.Callback, box.Text, enter)
+		end
+	end)
+
+	return { Get = function() return box.Text end }
+end
+
+local function createButton(body, order, opts)
+	opts = opts or {}
+
+	local row = new("TextButton", {
+		Size = UDim2.new(1, 0, 0, 34),
+		BackgroundColor3 = Theme.Element,
+		Text = "",
+		AutoButtonColor = false,
+		LayoutOrder = order,
+		Parent = body,
+	})
+	corner(row, 8)
+	stroke(row, Theme.Stroke, 1, 0.55)
+
+	local label = new("TextLabel", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 1, 0),
+		Font = Enum.Font.GothamBold,
+		Text = opts.Name or "Button",
+		TextColor3 = Theme.Text,
+		TextSize = 12,
+		Parent = row,
+	})
+
+	row.MouseEnter:Connect(function()
+		tween(row, 0.15, { BackgroundColor3 = Theme.Accent })
+		tween(label, 0.15, { TextColor3 = Theme.White })
+	end)
+	row.MouseLeave:Connect(function()
+		tween(row, 0.15, { BackgroundColor3 = Theme.Element })
+		tween(label, 0.15, { TextColor3 = Theme.Text })
+	end)
+	row.Activated:Connect(function()
+		if opts.Callback then
+			task.spawn(opts.Callback)
+		end
+	end)
+
+	return row
+end
+
+local function createLabel(body, order, opts)
+	opts = opts or {}
+	local label = new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		Text = opts.Text or "",
+		TextColor3 = Theme.TextDim,
+		TextSize = 12,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		LayoutOrder = order,
+		Parent = body,
+	})
+	pad(label, 2, 4, 2, 2)
+	return label
+end
+
+local function createColors(body, order, opts)
+	opts = opts or {}
+	local colors = opts.Colors or {}
+
+	local row = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 40),
+		BackgroundColor3 = Theme.Element,
+		LayoutOrder = order,
+		Parent = body,
+	})
+	corner(row, 8)
+	stroke(row, Theme.Stroke, 1, 0.55)
+
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 12, 0, 0),
+		Size = UDim2.new(1, -200, 1, 0),
+		Font = Enum.Font.GothamMedium,
+		Text = opts.Name or "Cor",
+		TextColor3 = Theme.Text,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = row,
+	})
+
+	local strip = new("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -12, 0.5, 0),
+		Size = UDim2.new(0, math.max(#colors * 26 - 6, 0), 0, 20),
+		BackgroundTransparency = 1,
+		Parent = row,
+	})
+	new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 6),
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+		Parent = strip,
+	})
+
+	local swatches = {}
+
+	local function select(color, silent)
+		for _, swatch in ipairs(swatches) do
+			swatch.Ring.Transparency = (swatch.Color == color) and 0 or 1
+		end
+		setAccent(color)
+		if not silent and opts.Callback then
+			task.spawn(opts.Callback, color)
+		end
+	end
+
+	for _, color in ipairs(colors) do
+		local button = new("TextButton", {
+			Size = UDim2.new(0, 20, 0, 20),
+			BackgroundColor3 = color,
+			Text = "",
+			AutoButtonColor = false,
+			Parent = strip,
+		})
+		corner(button, 10)
+		local ring = stroke(button, Theme.White, 2, 1)
+		button.Activated:Connect(function()
+			select(color)
+		end)
+		table.insert(swatches, { Button = button, Ring = ring, Color = color })
+	end
+
+	return { Select = function(color) select(color, true) end }
+end
+
+--=============================================================
+-- JANELA
+--=============================================================
+
+local function createWindow(config)
+	config = config or {}
+	local fullSize = config.Size or UDim2.new(0, 660, 0, 460)
+	local toggleKey = config.ToggleKey or Enum.KeyCode.RightShift
+
+	local shadow = new("Frame", {
+		Name = "Shadow",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 8),
+		Size = UDim2.new(0, fullSize.X.Offset + 8, 0, fullSize.Y.Offset + 8),
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ZIndex = 0,
+		Parent = gui,
+	})
+	corner(shadow, 18)
+
+	local root = new("CanvasGroup", {
+		Name = "Root",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 0),
+		Size = fullSize,
+		BackgroundColor3 = Theme.Bg,
+		ClipsDescendants = true,
+		GroupTransparency = 1,
+		ZIndex = 1,
+		Parent = gui,
+	})
+	corner(root, 14)
+	stroke(root, Theme.Stroke, 1, 0.35)
+
+	local topbar = new("Frame", {
+		Name = "Topbar",
+		Size = UDim2.new(1, 0, 0, 46),
+		BackgroundTransparency = 1,
+		Active = true,
+		ZIndex = 3,
+		Parent = root,
+	})
+
+	local dot = new("Frame", {
+		Size = UDim2.new(0, 9, 0, 9),
+		Position = UDim2.new(0, 18, 0, 14),
+		BackgroundColor3 = Theme.Accent,
+		Parent = topbar,
+	})
+	corner(dot, 5)
+	onAccent(function(color)
+		dot.BackgroundColor3 = color
+	end)
+
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 34, 0, 7),
+		Size = UDim2.new(0, 320, 0, 18),
+		Font = Enum.Font.GothamBold,
+		Text = config.Title or "Interface",
+		TextColor3 = Theme.Text,
+		TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = topbar,
+	})
+
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 34, 0, 25),
+		Size = UDim2.new(0, 320, 0, 14),
+		Font = Enum.Font.Gotham,
+		Text = config.Subtitle or "v1.0.0",
+		TextColor3 = Theme.TextDim,
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = topbar,
+	})
+
+	local function topButton(glyph, xOffset, hoverColor)
+		local btn = new("TextButton", {
+			AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, xOffset, 0, 8),
+			Size = UDim2.new(0, 30, 0, 30),
+			BackgroundColor3 = Theme.Element,
+			BackgroundTransparency = 1,
+			Text = glyph,
+			Font = Enum.Font.GothamBold,
+			TextSize = 13,
+			TextColor3 = Theme.TextDim,
+			AutoButtonColor = false,
+			ZIndex = 4,
+			Parent = topbar,
+		})
+		corner(btn, 8)
+		btn.MouseEnter:Connect(function()
+			tween(btn, 0.15, {
+				BackgroundColor3 = hoverColor or Theme.Element,
+				BackgroundTransparency = 0,
+				TextColor3 = Theme.White,
+			})
+		end)
+		btn.MouseLeave:Connect(function()
+			tween(btn, 0.15, {
+				BackgroundTransparency = 1,
+				TextColor3 = Theme.TextDim,
+			})
+		end)
+		return btn
+	end
+
+	local closeBtn = topButton("✕", -12, Theme.Danger)
+	local minBtn = topButton("—", -48, Theme.Element)
+
+	local sidebar = new("Frame", {
+		Name = "Sidebar",
+		Position = UDim2.new(0, 10, 0, 46),
+		Size = UDim2.new(0, 158, 1, -56),
+		BackgroundColor3 = Theme.Sidebar,
+		ZIndex = 2,
+		Parent = root,
+	})
+	corner(sidebar, 10)
+
+	local tabList = new("Frame", {
+		Size = UDim2.new(1, -12, 1, -12),
+		Position = UDim2.new(0, 6, 0, 6),
+		BackgroundTransparency = 1,
+		Parent = sidebar,
+	})
+	new("UIListLayout", {
+		Padding = UDim.new(0, 4),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Parent = tabList,
+	})
+
+	local content = new("Frame", {
+		Name = "Content",
+		Position = UDim2.new(0, 178, 0, 46),
+		Size = UDim2.new(1, -188, 1, -56),
+		BackgroundTransparency = 1,
+		ZIndex = 2,
+		Parent = root,
+	})
+
+	local win = {
+		Tabs = {},
+		CurrentTab = nil,
+		Open = true,
+		Root = root,
 	}
 
-	type Reply = { ok: boolean, message: string, data: any? }
+	local previousPage = nil
 
-	local FORCEFIELD_NAME = "DevToolsGodMode"
-	local states: { [Player]: PlayerState } = {}
-
-	local function reply(ok: boolean, message: string, data: any?): Reply
-		return { ok = ok, message = message, data = data }
-	end
-
-	local function isAuthorized(player: Player): boolean
-		if inStudioAllowed then
-			return true
-		end
-		return table.find(Config.AllowedUserIds, player.UserId) ~= nil
-	end
-
-	local function getState(player: Player): PlayerState
-		local state = states[player]
-		if not state then
-			state = { god = false, walkSpeed = nil, jumpPower = nil, godConnection = nil, recentRequests = {} }
-			states[player] = state
-		end
-		return state
-	end
-
-	local function allowRequest(state: PlayerState): boolean
-		local now = os.clock()
-		local recent = state.recentRequests
-		while #recent > 0 and now - recent[1] > 1 do
-			table.remove(recent, 1)
-		end
-		if #recent >= Config.RequestsPerSecond then
-			return false
-		end
-		table.insert(recent, now)
-		return true
-	end
-
-	local function getHumanoid(player: Player): Humanoid?
-		local character = player.Character
-		if not character then
-			return nil
-		end
-		return character:FindFirstChildOfClass("Humanoid")
-	end
-
-	local function applyGod(state: PlayerState, character: Model, enabled: boolean)
-		if state.godConnection then
-			state.godConnection:Disconnect()
-			state.godConnection = nil
-		end
-		local old = character:FindFirstChild(FORCEFIELD_NAME)
-		if old then
-			old:Destroy()
-		end
-		local humanoid = character:FindFirstChildOfClass("Humanoid")
-		if not enabled or not humanoid then
+	local function selectTab(tab)
+		if win.CurrentTab == tab then
 			return
 		end
-		local forceField = Instance.new("ForceField")
-		forceField.Name = FORCEFIELD_NAME
-		forceField.Visible = false
-		forceField.Parent = character
-		humanoid.Health = humanoid.MaxHealth
-		state.godConnection = humanoid.HealthChanged:Connect(function()
-			if humanoid.Health > 0 and humanoid.Health < humanoid.MaxHealth then
-				humanoid.Health = humanoid.MaxHealth
+		for _, other in ipairs(win.Tabs) do
+			other:SetSelected(false)
+		end
+		win.CurrentTab = tab
+		tab:SetSelected(true)
+
+		if previousPage and previousPage ~= tab.Page then
+			previousPage.Visible = false
+		end
+		previousPage = tab.Page
+
+		tab.Page.Visible = true
+		tab.Page.GroupTransparency = 1
+		tab.Page.Position = UDim2.new(0, 12, 0, 0)
+		tween(tab.Page, 0.28, {
+			GroupTransparency = 0,
+			Position = UDim2.new(0, 0, 0, 0),
+		}, Enum.EasingStyle.Quint)
+	end
+
+	function win:CreateTab(tabConfig)
+		tabConfig = tabConfig or {}
+		local order = #self.Tabs + 1
+
+		local page = new("CanvasGroup", {
+			Name = "Page_" .. order,
+			Size = UDim2.new(1, 0, 1, 0),
+			BackgroundTransparency = 1,
+			Visible = false,
+			Parent = content,
+		})
+
+		local scroll = new("ScrollingFrame", {
+			Name = "Scroll",
+			Size = UDim2.new(1, 0, 1, 0),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ScrollBarThickness = 3,
+			ScrollBarImageColor3 = Theme.Accent,
+			CanvasSize = UDim2.new(0, 0, 0, 0),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			Parent = page,
+		})
+		new("UIListLayout", {
+			Padding = UDim.new(0, 10),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			Parent = scroll,
+		})
+		pad(scroll, 0, 6, 10, 0)
+		onAccent(function(color)
+			scroll.ScrollBarImageColor3 = color
+		end)
+
+		local button = new("TextButton", {
+			Name = "Tab_" .. order,
+			Size = UDim2.new(1, 0, 0, 34),
+			BackgroundColor3 = Theme.Element,
+			BackgroundTransparency = 1,
+			Text = "",
+			AutoButtonColor = false,
+			LayoutOrder = order,
+			Parent = tabList,
+		})
+		corner(button, 8)
+
+		local bar = new("Frame", {
+			Size = UDim2.new(0, 3, 0, 16),
+			Position = UDim2.new(0, 0, 0.5, -8),
+			BackgroundColor3 = Theme.Accent,
+			BackgroundTransparency = 1,
+			Parent = button,
+		})
+		corner(bar, 2)
+		onAccent(function(color)
+			bar.BackgroundColor3 = color
+		end)
+
+		local icon = new("TextLabel", {
+			BackgroundTransparency = 1,
+			Position = UDim2.new(0, 14, 0, 0),
+			Size = UDim2.new(0, 18, 1, 0),
+			Font = Enum.Font.GothamBold,
+			Text = tabConfig.Icon or "•",
+			TextColor3 = Theme.TextDim,
+			TextSize = 13,
+			Parent = button,
+		})
+
+		local label = new("TextLabel", {
+			BackgroundTransparency = 1,
+			Position = UDim2.new(0, 34, 0, 0),
+			Size = UDim2.new(1, -40, 1, 0),
+			Font = Enum.Font.GothamMedium,
+			Text = tabConfig.Title or ("Tab " .. order),
+			TextColor3 = Theme.TextDim,
+			TextSize = 13,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Parent = button,
+		})
+
+		local tab = { Page = page, Button = button }
+
+		function tab:SetSelected(state)
+			if state then
+				button.BackgroundTransparency = 0
+				bar.BackgroundTransparency = 0
+				label.TextColor3 = Theme.Text
+				icon.TextColor3 = Theme.Accent
+			else
+				button.BackgroundTransparency = 1
+				bar.BackgroundTransparency = 1
+				label.TextColor3 = Theme.TextDim
+				icon.TextColor3 = Theme.TextDim
+			end
+		end
+
+		onAccent(function(color)
+			if win.CurrentTab == tab then
+				icon.TextColor3 = color
 			end
 		end)
-	end
 
-	local function applyMovement(state: PlayerState, humanoid: Humanoid)
-		if state.walkSpeed then
-			humanoid.WalkSpeed = state.walkSpeed
-		end
-		if state.jumpPower then
-			humanoid.UseJumpPower = true
-			humanoid.JumpPower = state.jumpPower
-		end
-	end
-
-	local function getWaypointFolder(): Folder?
-		local folder = Workspace:FindFirstChild(Config.WaypointFolderName)
-		if folder and folder:IsA("Folder") then
-			return folder
-		end
-		return nil
-	end
-
-	local function waypointPivot(waypoint: Instance): CFrame?
-		if waypoint:IsA("BasePart") then
-			return waypoint.CFrame * CFrame.new(0, waypoint.Size.Y / 2 + 3, 0)
-		elseif waypoint:IsA("Model") then
-			return waypoint:GetPivot() * CFrame.new(0, 3, 0)
-		end
-		return nil
-	end
-
-	local function findPlayer(query: any): Player?
-		if type(query) == "number" then
-			return Players:GetPlayerByUserId(query)
-		end
-		if type(query) ~= "string" or query == "" then
-			return nil
-		end
-		local lowered = string.lower(query)
-		local prefixMatch: Player? = nil
-		local prefixCount = 0
-		for _, candidate in Players:GetPlayers() do
-			local name = string.lower(candidate.Name)
-			if name == lowered then
-				return candidate
+		button.MouseEnter:Connect(function()
+			if win.CurrentTab ~= tab then
+				button.BackgroundTransparency = 0.5
 			end
-			if string.sub(name, 1, #lowered) == lowered then
-				prefixMatch = candidate
-				prefixCount += 1
+		end)
+		button.MouseLeave:Connect(function()
+			if win.CurrentTab ~= tab then
+				button.BackgroundTransparency = 1
 			end
+		end)
+		button.Activated:Connect(function()
+			selectTab(tab)
+		end)
+
+		local sectionCount = 0
+
+		function tab:CreateSection(sectionTitle)
+			sectionCount = sectionCount + 1
+
+			local holder = new("Frame", {
+				Size = UDim2.new(1, 0, 0, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundTransparency = 1,
+				LayoutOrder = sectionCount,
+				Parent = scroll,
+			})
+			new("UIListLayout", {
+				Padding = UDim.new(0, 8),
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				Parent = holder,
+			})
+
+			local head = new("Frame", {
+				Size = UDim2.new(1, 0, 0, 18),
+				BackgroundTransparency = 1,
+				LayoutOrder = 1,
+				Parent = holder,
+			})
+
+			local tick = new("Frame", {
+				Size = UDim2.new(0, 3, 0, 11),
+				Position = UDim2.new(0, 0, 0.5, -5),
+				BackgroundColor3 = Theme.Accent,
+				Parent = head,
+			})
+			corner(tick, 2)
+			onAccent(function(color)
+				tick.BackgroundColor3 = color
+			end)
+
+			new("TextLabel", {
+				BackgroundTransparency = 1,
+				Position = UDim2.new(0, 10, 0, 0),
+				Size = UDim2.new(1, -10, 1, 0),
+				Font = Enum.Font.GothamBold,
+				Text = string.upper(sectionTitle or "Section"),
+				TextColor3 = Theme.TextDim,
+				TextSize = 11,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				Parent = head,
+			})
+
+			local body = new("Frame", {
+				Size = UDim2.new(1, 0, 0, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundTransparency = 1,
+				LayoutOrder = 2,
+				Parent = holder,
+			})
+			new("UIListLayout", {
+				Padding = UDim.new(0, 6),
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				Parent = body,
+			})
+
+			local rowOrder = 0
+			local function nextOrder()
+				rowOrder = rowOrder + 1
+				return rowOrder
+			end
+
+			local section = {}
+
+			function section:CreateToggle(opts)
+				return createToggle(body, nextOrder(), opts)
+			end
+			function section:CreateSlider(opts)
+				return createSlider(body, nextOrder(), opts)
+			end
+			function section:CreateDropdown(opts)
+				return createDropdown(body, nextOrder(), opts)
+			end
+			function section:CreateKeybind(opts)
+				return createKeybind(body, nextOrder(), opts)
+			end
+			function section:CreateTextbox(opts)
+				return createTextbox(body, nextOrder(), opts)
+			end
+			function section:CreateButton(opts)
+				return createButton(body, nextOrder(), opts)
+			end
+			function section:CreateLabel(opts)
+				return createLabel(body, nextOrder(), opts)
+			end
+			function section:CreateColors(opts)
+				return createColors(body, nextOrder(), opts)
+			end
+
+			return section
 		end
-		if prefixCount == 1 then
-			return prefixMatch
+
+		table.insert(self.Tabs, tab)
+		if #self.Tabs == 1 then
+			selectTab(tab)
 		end
-		return nil
+
+		return tab
 	end
 
-	local function pivotCharacter(player: Player, target: CFrame): Reply
-		local character = player.Character
-		if not character then
-			return reply(false, "No character to move")
-		end
-		character:PivotTo(target)
-		return reply(true, "Teleported")
+	function win:Notify(opts)
+		return notify(opts)
 	end
 
-	local handlers: { [string]: (Player, PlayerState, any) -> Reply } = {}
+	local minimized = false
 
-	handlers.auth = function(_player, _state, _payload)
-		return reply(true, "Authorized")
-	end
+	function win:SetOpen(state)
+		if self.Open == state then
+			return
+		end
+		self.Open = state
 
-	handlers.god = function(player, state, payload)
-		if type(payload) ~= "boolean" then
-			return reply(false, "god expects a boolean")
-		end
-		state.god = payload
-		if player.Character then
-			applyGod(state, player.Character, payload)
-		end
-		return reply(true, payload and "God mode ON" or "God mode OFF")
-	end
-
-	handlers.speed = function(player, state, payload)
-		if not Util.isInRange(payload, 0, Config.Limits.MaxWalkSpeed) then
-			return reply(false, string.format("Speed must be 0..%d", Config.Limits.MaxWalkSpeed))
-		end
-		state.walkSpeed = payload
-		local humanoid = getHumanoid(player)
-		if humanoid then
-			applyMovement(state, humanoid)
-		end
-		return reply(true, string.format("WalkSpeed = %.1f", payload))
-	end
-
-	handlers.jump = function(player, state, payload)
-		if not Util.isInRange(payload, 0, Config.Limits.MaxJumpPower) then
-			return reply(false, string.format("Jump power must be 0..%d", Config.Limits.MaxJumpPower))
-		end
-		state.jumpPower = payload
-		local humanoid = getHumanoid(player)
-		if humanoid then
-			applyMovement(state, humanoid)
-		end
-		return reply(true, string.format("JumpPower = %.1f", payload))
-	end
-
-	handlers.resetMovement = function(player, state, _payload)
-		state.walkSpeed = nil
-		state.jumpPower = nil
-		local humanoid = getHumanoid(player)
-		if humanoid then
-			humanoid.WalkSpeed = Config.Defaults.WalkSpeed
-			humanoid.UseJumpPower = true
-			humanoid.JumpPower = Config.Defaults.JumpPower
-		end
-		return reply(true, "Movement reset to defaults")
-	end
-
-	handlers.teleport = function(player, _state, payload)
-		local limit = Config.Limits.MaxCoordinate
-		if
-			type(payload) ~= "table"
-			or not Util.isInRange(payload.x, -limit, limit)
-			or not Util.isInRange(payload.y, -limit, limit)
-			or not Util.isInRange(payload.z, -limit, limit)
-		then
-			return reply(false, string.format("Coordinates must be finite and within +-%d", limit))
-		end
-		return pivotCharacter(player, CFrame.new(payload.x, payload.y, payload.z))
-	end
-
-	handlers.teleportToPlayer = function(player, _state, payload)
-		local target = findPlayer(payload)
-		if not target or target == player then
-			return reply(false, "No unique matching player (or that is you)")
-		end
-		local targetCharacter = target.Character
-		if not targetCharacter then
-			return reply(false, target.Name .. " has no character")
-		end
-		return pivotCharacter(player, targetCharacter:GetPivot() * CFrame.new(3, 0, 0))
-	end
-
-	handlers.listWaypoints = function(_player, _state, _payload)
-		local names: { string } = {}
-		local folder = getWaypointFolder()
-		if folder then
-			for _, child in folder:GetChildren() do
-				if waypointPivot(child) then
-					table.insert(names, child.Name)
+		if state then
+			root.Visible = true
+			shadow.Visible = true
+			root.GroupTransparency = 1
+			root.Size = UDim2.new(
+				fullSize.X.Scale, fullSize.X.Offset * 0.94,
+				fullSize.Y.Scale, fullSize.Y.Offset * 0.94
+			)
+			tween(root, 0.28, { GroupTransparency = 0, Size = fullSize }, Enum.EasingStyle.Quint)
+			shadow.BackgroundTransparency = 1
+			tween(shadow, 0.28, { BackgroundTransparency = 0.55 })
+		else
+			tween(root, 0.2, {
+				GroupTransparency = 1,
+				Size = UDim2.new(
+					fullSize.X.Scale, fullSize.X.Offset * 0.94,
+					fullSize.Y.Scale, fullSize.Y.Offset * 0.94
+				),
+			})
+			tween(shadow, 0.2, { BackgroundTransparency = 1 })
+			task.delay(0.22, function()
+				if not self.Open then
+					root.Visible = false
+					shadow.Visible = false
 				end
-			end
-			table.sort(names)
+			end)
 		end
-		return reply(true, string.format("%d waypoint(s)", #names), names)
 	end
 
-	handlers.teleportToWaypoint = function(player, _state, payload)
-		if type(payload) ~= "string" or payload == "" then
-			return reply(false, "Waypoint name expected")
-		end
-		local folder = getWaypointFolder()
-		local waypoint = folder and folder:FindFirstChild(payload)
-		local pivot = waypoint and waypointPivot(waypoint)
-		if not pivot then
-			return reply(false, "Waypoint not found: " .. payload)
-		end
-		return pivotCharacter(player, pivot)
+	function win:Toggle()
+		self:SetOpen(not self.Open)
 	end
 
-	local request = Instance.new("RemoteFunction")
-	request.Name = "DevToolsRequest"
-
-	request.OnServerInvoke = function(player: Player, action: any, payload: any): Reply
-		if not isAuthorized(player) then
-			return reply(false, "Not authorized")
-		end
-		if type(action) ~= "string" then
-			return reply(false, "Bad request")
-		end
-		local handler = handlers[action]
-		if not handler then
-			return reply(false, "Unknown action")
-		end
-		local state = getState(player)
-		if not allowRequest(state) then
-			return reply(false, "Rate limited")
-		end
-		if action ~= "auth" and action ~= "listWaypoints" then
-			print(string.format("[DevTools] %s (%d): %s", player.Name, player.UserId, action))
-		end
-		local ok, result = pcall(handler, player, state, payload)
-		if not ok then
-			warn("[DevTools] handler '" .. action .. "' failed: " .. tostring(result))
-			return reply(false, "Internal error")
-		end
-		return result
-	end
-
-	local function onCharacterAdded(player: Player, character: Model)
-		local state = states[player]
-		if not state then
+	function win:SetMinimized(state)
+		if minimized == state then
 			return
 		end
-		local humanoid = character:WaitForChild("Humanoid", 10)
-		if not humanoid or not humanoid:IsA("Humanoid") then
-			return
+		minimized = state
+
+		if state then
+			sidebar.Visible = false
+			content.Visible = false
+			tween(root, 0.25, { Size = UDim2.new(0, 340, 0, 46) }, Enum.EasingStyle.Quint)
+			tween(shadow, 0.25, { Size = UDim2.new(0, 348, 0, 54) }, Enum.EasingStyle.Quint)
+		else
+			tween(root, 0.25, { Size = fullSize }, Enum.EasingStyle.Quint)
+			tween(shadow, 0.25, {
+				Size = UDim2.new(0, fullSize.X.Offset + 8, 0, fullSize.Y.Offset + 8),
+			}, Enum.EasingStyle.Quint)
+			task.delay(0.08, function()
+				if not minimized then
+					sidebar.Visible = true
+					content.Visible = true
+				end
+			end)
 		end
-		applyMovement(state, humanoid)
-		applyGod(state, character, state.god)
 	end
 
-	local function onPlayerAdded(player: Player)
-		player.CharacterAdded:Connect(function(character)
-			onCharacterAdded(player, character)
-		end)
-	end
+	-- arraste
+	local dragging = false
+	local dragStart, startPos
 
-	Players.PlayerAdded:Connect(onPlayerAdded)
-	for _, player in Players:GetPlayers() do
-		onPlayerAdded(player)
-	end
-
-	Players.PlayerRemoving:Connect(function(player)
-		local state = states[player]
-		if state and state.godConnection then
-			state.godConnection:Disconnect()
+	topbar.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = root.Position
 		end
-		states[player] = nil
 	end)
 
-	-- Waypoint markers are debug aids: invisible, non-colliding, non-interactive while the game runs.
-	local waypointFolder = getWaypointFolder()
-	if waypointFolder then
-		for _, child in waypointFolder:GetChildren() do
-			if child:IsA("BasePart") then
-				child.Transparency = 1
-				child.CanCollide = false
-				child.CanTouch = false
-				child.CanQuery = false
-			end
+	UserInputService.InputChanged:Connect(function(input)
+		if not dragging then
+			return
 		end
-	end
+		if input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch then
+			local delta = input.Position - dragStart
+			root.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y
+			)
+			shadow.Position = UDim2.new(
+				root.Position.X.Scale, root.Position.X.Offset,
+				root.Position.Y.Scale, root.Position.Y.Offset + 8
+			)
+		end
+	end)
 
-	request.Parent = ReplicatedStorage
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
 
-	-- Same file, client half: clone this Script with RunContext = Client into StarterPlayerScripts.
-	local clientCopy = script:Clone()
-	clientCopy.RunContext = Enum.RunContext.Client
-	clientCopy.Parent = StarterPlayer:WaitForChild("StarterPlayerScripts")
+	UserInputService.InputBegan:Connect(function(input, processed)
+		if processed then
+			return
+		end
+		if input.KeyCode == toggleKey then
+			win:Toggle()
+		end
+	end)
+
+	closeBtn.Activated:Connect(function()
+		win:SetOpen(false)
+	end)
+	minBtn.Activated:Connect(function()
+		win:SetMinimized(not minimized)
+	end)
+
+	shadow.BackgroundTransparency = 0.55
+	tween(root, 0.35, { GroupTransparency = 0 }, Enum.EasingStyle.Quint)
+
+	return win
 end
 
------------------------------------------------------------------------- Client
-local function runClient()
-	local localPlayer = Players.LocalPlayer
+--=============================================================
+-- DEMONSTRAÇÃO
+--=============================================================
 
-	-- The server only creates this remote when the runtime is active, so absence means "stay inert".
-	local remote = ReplicatedStorage:WaitForChild("DevToolsRequest", 8)
-	if not remote or not remote:IsA("RemoteFunction") then
-		return
-	end
+local Window = createWindow({
+	Title = "Aurora",
+	Subtitle = "v1.0.0  ·  RightShift abre/fecha",
+	ToggleKey = Enum.KeyCode.RightShift,
+	Size = UDim2.new(0, 660, 0, 460),
+})
 
-	local function call(action: string, payload: any?): (boolean, string, any?)
-		local invoked, result = pcall(function()
-			return remote:InvokeServer(action, payload)
-		end)
-		if not invoked or type(result) ~= "table" then
-			return false, "Request failed", nil
+local mainTab = Window:CreateTab({ Title = "Principal", Icon = "◆" })
+local visualsTab = Window:CreateTab({ Title = "Visual", Icon = "✦" })
+local interfaceTab = Window:CreateTab({ Title = "Interface", Icon = "◈" })
+
+-- Principal ---------------------------------------------------
+
+local combat = mainTab:CreateSection("Combate")
+
+combat:CreateToggle({
+	Name = "Aimbot",
+	Default = false,
+	Callback = function(state)
+		Window:Notify({
+			Title = "Aimbot",
+			Text = state and "ativado" or "desativado",
+			Color = state and Theme.Success or Theme.Danger,
+		})
+	end,
+})
+
+combat:CreateToggle({ Name = "Team Check", Default = true })
+combat:CreateSlider({ Name = "FOV", Min = 10, Max = 360, Default = 90, Suffix = "°" })
+combat:CreateSlider({ Name = "Suavidade", Min = 1, Max = 20, Default = 6, Suffix = "x" })
+combat:CreateKeybind({ Name = "Tecla de mira", Default = Enum.KeyCode.E })
+
+local movement = mainTab:CreateSection("Movimento")
+
+movement:CreateSlider({ Name = "Velocidade", Min = 16, Max = 200, Default = 16 })
+movement:CreateSlider({ Name = "Pulo", Min = 50, Max = 200, Default = 50 })
+movement:CreateToggle({ Name = "Voar", Default = false })
+
+local actions = mainTab:CreateSection("Ações")
+
+actions:CreateButton({
+	Name = "Testar notificação",
+	Callback = function()
+		Window:Notify({
+			Title = "Tudo certo",
+			Text = "A interface está respondendo.",
+			Color = Theme.Success,
+		})
+	end,
+})
+
+actions:CreateButton({
+	Name = "Resetar configurações",
+	Callback = function()
+		Window:Notify({
+			Title = "Configurações",
+			Text = "Valores restaurados.",
+			Color = Theme.Warning or Theme.Accent,
+		})
+	end,
+})
+
+-- Visual ------------------------------------------------------
+
+local espSection = visualsTab:CreateSection("ESP")
+
+espSection:CreateToggle({ Name = "ESP ativo", Default = true })
+espSection:CreateToggle({ Name = "Caixas", Default = true })
+espSection:CreateToggle({ Name = "Nomes", Default = false })
+espSection:CreateSlider({ Name = "Distância", Min = 100, Max = 2000, Default = 1000, Step = 50, Suffix = "m" })
+
+espSection:CreateDropdown({
+	Name = "Cor do traço",
+	Options = { "Branco", "Roxo", "Verde", "Vermelho" },
+	Default = "Roxo",
+	Callback = function(item)
+		Window:Notify({ Title = "Traço", Text = "cor: " .. item })
+	end,
+})
+
+espSection:CreateDropdown({
+	Name = "Estilo da caixa",
+	Options = { "2D", "3D", "Cantos" },
+	Default = "2D",
+})
+
+-- Interface ---------------------------------------------------
+
+local style = interfaceTab:CreateSection("Aparência")
+
+style:CreateColors({
+	Name = "Cor de destaque",
+	Colors = {
+		Color3.fromRGB(139, 92, 246),
+		Color3.fromRGB(59, 130, 246),
+		Color3.fromRGB(52, 199, 123),
+		Color3.fromRGB(236, 72, 153),
+		Color3.fromRGB(240, 177, 60),
+	},
+})
+
+style:CreateSlider({
+	Name = "Transparência",
+	Min = 0,
+	Max = 70,
+	Default = 0,
+	Suffix = "%",
+	Callback = function(value)
+		Window.Root.BackgroundTransparency = value / 100
+	end,
+})
+
+local about = interfaceTab:CreateSection("Sobre")
+
+about:CreateLabel({
+	Text = "Aurora UI — biblioteca de interface em arquivo único. Arraste pela barra superior, minimize pelo botão à esquerda do fechar, alterne com RightShift.",
+})
+
+about:CreateTextbox({
+	Name = "Seu nome",
+	Placeholder = "digite aqui",
+	Callback = function(text)
+		if text ~= "" then
+			Window:Notify({ Title = "Olá", Text = text })
 		end
-		return result.ok == true, tostring(result.message), result.data
-	end
+	end,
+})
 
-	if not (call("auth")) then
-		return
-	end
+about:CreateKeybind({
+	Name = "Atalho alternativo",
+	Default = Enum.KeyCode.RightShift,
+})
 
-	--------------------------------------------------------------------------- UI
+_G.Aurora = Window
 
-	local BG = Color3.fromRGB(24, 26, 32)
-	local PANEL = Color3.fromRGB(36, 39, 48)
-	local ACCENT = Color3.fromRGB(70, 130, 220)
-	local ON = Color3.fromRGB(60, 160, 90)
-	local TEXT = Color3.fromRGB(225, 228, 235)
-
-	local gui = Instance.new("ScreenGui")
-	gui.Name = "DevToolsMenu"
-	gui.ResetOnSpawn = false
-	gui.DisplayOrder = 1000
-	gui.Enabled = false
-	gui.Parent = localPlayer:WaitForChild("PlayerGui")
-
-	local window = Instance.new("Frame")
-	window.Size = UDim2.fromOffset(340, 480)
-	window.Position = UDim2.fromOffset(16, 80)
-	window.BackgroundColor3 = BG
-	window.BorderSizePixel = 0
-	window.Parent = gui
-
-	local titleBar = Instance.new("TextLabel")
-	titleBar.Size = UDim2.new(1, 0, 0, 28)
-	titleBar.BackgroundColor3 = ACCENT
-	titleBar.BorderSizePixel = 0
-	titleBar.Text = "  Dev Tools  (" .. Config.ToggleKey.Name .. " to hide)"
-	titleBar.TextColor3 = Color3.new(1, 1, 1)
-	titleBar.TextXAlignment = Enum.TextXAlignment.Left
-	titleBar.Font = Enum.Font.GothamBold
-	titleBar.TextSize = 14
-	titleBar.Active = true
-	titleBar.Parent = window
-
-	local hud = Instance.new("TextLabel")
-	hud.Position = UDim2.fromOffset(0, 28)
-	hud.Size = UDim2.new(1, 0, 0, 84)
-	hud.BackgroundColor3 = PANEL
-	hud.BorderSizePixel = 0
-	hud.TextColor3 = TEXT
-	hud.TextXAlignment = Enum.TextXAlignment.Left
-	hud.TextYAlignment = Enum.TextYAlignment.Top
-	hud.Font = Enum.Font.Code
-	hud.TextSize = 13
-	hud.Text = ""
-	hud.Parent = window
-
-	local status = Instance.new("TextLabel")
-	status.AnchorPoint = Vector2.new(0, 1)
-	status.Position = UDim2.new(0, 0, 1, 0)
-	status.Size = UDim2.new(1, 0, 0, 24)
-	status.BackgroundColor3 = PANEL
-	status.BorderSizePixel = 0
-	status.TextColor3 = TEXT
-	status.TextXAlignment = Enum.TextXAlignment.Left
-	status.Font = Enum.Font.Gotham
-	status.TextSize = 13
-	status.Text = "  Ready"
-	status.Parent = window
-
-	local content = Instance.new("ScrollingFrame")
-	content.Position = UDim2.fromOffset(0, 116)
-	content.Size = UDim2.new(1, 0, 1, -144)
-	content.BackgroundTransparency = 1
-	content.BorderSizePixel = 0
-	content.ScrollBarThickness = 6
-	content.CanvasSize = UDim2.new()
-	content.AutomaticCanvasSize = Enum.AutomaticSize.Y
-	content.Parent = window
-
-	local layout = Instance.new("UIListLayout")
-	layout.Padding = UDim.new(0, 6)
-	layout.SortOrder = Enum.SortOrder.LayoutOrder
-	layout.Parent = content
-
-	local padding = Instance.new("UIPadding")
-	padding.PaddingLeft = UDim.new(0, 8)
-	padding.PaddingRight = UDim.new(0, 14)
-	padding.PaddingTop = UDim.new(0, 4)
-	padding.Parent = content
-
-	local nextOrder = 0
-	local function order(): number
-		nextOrder += 1
-		return nextOrder
-	end
-
-	local function setStatus(ok: boolean, message: string)
-		status.Text = (ok and "  OK: " or "  ERR: ") .. message
-		status.TextColor3 = ok and Color3.fromRGB(130, 220, 150) or Color3.fromRGB(240, 130, 130)
-	end
-
-	local function makeButton(parent: Instance, text: string, size: UDim2, callback: () -> ()): TextButton
-		local button = Instance.new("TextButton")
-		button.Size = size
-		button.BackgroundColor3 = PANEL
-		button.BorderSizePixel = 0
-		button.TextColor3 = TEXT
-		button.Font = Enum.Font.Gotham
-		button.TextSize = 13
-		button.Text = text
-		button.AutoButtonColor = true
-		button.Parent = parent
-		button.Activated:Connect(callback)
-		return button
-	end
-
-	local function makeRow(): Frame
-		local row = Instance.new("Frame")
-		row.Size = UDim2.new(1, 0, 0, 28)
-		row.BackgroundTransparency = 1
-		row.LayoutOrder = order()
-		row.Parent = content
-		return row
-	end
-
-	local function makeToggle(text: string, onChange: (boolean) -> boolean): TextButton
-		local row = makeRow()
-		local value = false
-		local button: TextButton
-		local function refresh()
-			button.Text = text .. ": " .. (value and "ON" or "OFF")
-			button.BackgroundColor3 = value and ON or PANEL
-		end
-		button = makeButton(row, "", UDim2.fromScale(1, 1), function()
-			-- onChange returns the value that actually took effect (false if the server refused)
-			value = onChange(not value)
-			refresh()
-		end)
-		refresh()
-		return button
-	end
-
-	local function makeInputRow(label: string, placeholder: string, buttonText: string, onSubmit: (string) -> ()): TextBox
-		local row = makeRow()
-		local labelFrame = Instance.new("TextLabel")
-		labelFrame.Size = UDim2.new(0, 70, 1, 0)
-		labelFrame.BackgroundTransparency = 1
-		labelFrame.TextColor3 = TEXT
-		labelFrame.TextXAlignment = Enum.TextXAlignment.Left
-		labelFrame.Font = Enum.Font.Gotham
-		labelFrame.TextSize = 13
-		labelFrame.Text = label
-		labelFrame.Parent = row
-
-		local box = Instance.new("TextBox")
-		box.Position = UDim2.fromOffset(72, 0)
-		box.Size = UDim2.new(1, -72 - 64, 1, 0)
-		box.BackgroundColor3 = PANEL
-		box.BorderSizePixel = 0
-		box.TextColor3 = TEXT
-		box.PlaceholderText = placeholder
-		box.PlaceholderColor3 = Color3.fromRGB(130, 135, 148)
-		box.ClearTextOnFocus = false
-		box.Font = Enum.Font.Code
-		box.TextSize = 13
-		box.Text = ""
-		box.Parent = row
-
-		makeButton(row, buttonText, UDim2.new(0, 60, 1, 0), function()
-			onSubmit(box.Text)
-		end).Position = UDim2.new(1, -60, 0, 0)
-		box.FocusLost:Connect(function(enterPressed)
-			if enterPressed then
-				onSubmit(box.Text)
-			end
-		end)
-		return box
-	end
-
-	-- Dragging by the title bar
-	do
-		local dragStart: Vector3? = nil
-		local windowStart = window.Position
-		titleBar.InputBegan:Connect(function(input)
-			if input.UserInputType == Enum.UserInputType.MouseButton1 then
-				dragStart = input.Position
-				windowStart = window.Position
-			end
-		end)
-		UserInputService.InputChanged:Connect(function(input)
-			if dragStart and input.UserInputType == Enum.UserInputType.MouseMovement then
-				local delta = input.Position - dragStart
-				window.Position = UDim2.fromOffset(windowStart.X.Offset + delta.X, windowStart.Y.Offset + delta.Y)
-			end
-		end)
-		UserInputService.InputEnded:Connect(function(input)
-			if input.UserInputType == Enum.UserInputType.MouseButton1 then
-				dragStart = nil
-			end
-		end)
-	end
-
-	------------------------------------------------------------ local movement tools
-
-	local function getRoot(): BasePart?
-		local character = localPlayer.Character
-		local root = character and character:FindFirstChild("HumanoidRootPart")
-		if root and root:IsA("BasePart") then
-			return root
-		end
-		return nil
-	end
-
-	local noclipConnection: RBXScriptConnection? = nil
-	local function setNoclip(enabled: boolean)
-		if noclipConnection then
-			noclipConnection:Disconnect()
-			noclipConnection = nil
-		end
-		if not enabled then
-			return
-		end
-		noclipConnection = RunService.Stepped:Connect(function()
-			local character = localPlayer.Character
-			if not character then
-				return
-			end
-			for _, descendant in character:GetDescendants() do
-				if descendant:IsA("BasePart") then
-					descendant.CanCollide = false
-				end
-			end
-		end)
-	end
-
-	local flyConnection: RBXScriptConnection? = nil
-	local function setFly(enabled: boolean)
-		if flyConnection then
-			flyConnection:Disconnect()
-			flyConnection = nil
-		end
-		local character = localPlayer.Character
-		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-		if not enabled then
-			if humanoid then
-				humanoid.PlatformStand = false
-			end
-			local root = getRoot()
-			if root then
-				root.AssemblyLinearVelocity = Vector3.zero
-			end
-			return
-		end
-		if humanoid then
-			humanoid.PlatformStand = true
-		end
-		flyConnection = RunService.RenderStepped:Connect(function()
-			local root = getRoot()
-			local camera = Workspace.CurrentCamera
-			if not root or not camera then
-				return
-			end
-			local direction = Vector3.zero
-			if UserInputService:GetFocusedTextBox() == nil then
-				local look = camera.CFrame.LookVector
-				local right = camera.CFrame.RightVector
-				if UserInputService:IsKeyDown(Enum.KeyCode.W) then direction += look end
-				if UserInputService:IsKeyDown(Enum.KeyCode.S) then direction -= look end
-				if UserInputService:IsKeyDown(Enum.KeyCode.D) then direction += right end
-				if UserInputService:IsKeyDown(Enum.KeyCode.A) then direction -= right end
-				if UserInputService:IsKeyDown(Enum.KeyCode.Space) then direction += Vector3.yAxis end
-				if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then direction -= Vector3.yAxis end
-			end
-			if direction.Magnitude > 0 then
-				direction = direction.Unit * Config.FlySpeed
-			end
-			root.AssemblyLinearVelocity = direction
-		end)
-	end
-
-	------------------------------------------------------------------ menu contents
-
-	makeToggle("God mode", function(want)
-		local ok, message = call("god", want)
-		setStatus(ok, message)
-		if ok then
-			return want
-		end
-		return not want
-	end)
-
-	makeToggle("Noclip (local)", function(want)
-		setNoclip(want)
-		setStatus(true, want and "Noclip ON (you fall through floors unless Fly is on)" or "Noclip OFF")
-		return want
-	end)
-
-	makeToggle("Fly (WASD, Space/Ctrl)", function(want)
-		setFly(want)
-		setStatus(true, want and "Fly ON" or "Fly OFF")
-		return want
-	end)
-
-	makeInputRow("WalkSpeed", "e.g. 50", "Set", function(text)
-		local value = tonumber(text)
-		if value == nil then
-			setStatus(false, "Enter a number")
-			return
-		end
-		setStatus(call("speed", value))
-	end)
-
-	makeInputRow("JumpPower", "e.g. 100", "Set", function(text)
-		local value = tonumber(text)
-		if value == nil then
-			setStatus(false, "Enter a number")
-			return
-		end
-		setStatus(call("jump", value))
-	end)
-
-	do
-		local row = makeRow()
-		makeButton(row, "Reset speed / jump", UDim2.fromScale(1, 1), function()
-			setStatus(call("resetMovement"))
-		end)
-	end
-
-	local coordsBox: TextBox
-	coordsBox = makeInputRow("Teleport", "x y z", "Go", function(text)
-		local vec = Util.parseVec3(text)
-		if not vec then
-			setStatus(false, "Expected three numbers: x y z")
-			return
-		end
-		setStatus(call("teleport", vec))
-	end)
-
-	do
-		local row = makeRow()
-		makeButton(row, "Fill with my current position", UDim2.fromScale(1, 1), function()
-			local root = getRoot()
-			if not root then
-				setStatus(false, "No character")
-				return
-			end
-			local p = root.Position
-			coordsBox.Text = Util.formatVec3(p.X, p.Y, p.Z)
-			setStatus(true, "Position copied into the box")
-		end)
-	end
-
-	makeInputRow("To player", "name or prefix", "Go", function(text)
-		setStatus(call("teleportToPlayer", Util.trim(text)))
-	end)
-
-	local waypointHeader = Instance.new("TextLabel")
-	waypointHeader.Size = UDim2.new(1, 0, 0, 20)
-	waypointHeader.BackgroundTransparency = 1
-	waypointHeader.TextColor3 = TEXT
-	waypointHeader.TextXAlignment = Enum.TextXAlignment.Left
-	waypointHeader.Font = Enum.Font.GothamBold
-	waypointHeader.TextSize = 13
-	waypointHeader.Text = "Waypoints (" .. Config.WaypointFolderName .. ")"
-	waypointHeader.LayoutOrder = order()
-	waypointHeader.Parent = content
-
-	local waypointList = Instance.new("Frame")
-	waypointList.Size = UDim2.new(1, 0, 0, 0)
-	waypointList.AutomaticSize = Enum.AutomaticSize.Y
-	waypointList.BackgroundTransparency = 1
-	waypointList.LayoutOrder = order()
-	waypointList.Parent = content
-	local waypointLayout = Instance.new("UIListLayout")
-	waypointLayout.Padding = UDim.new(0, 4)
-	waypointLayout.Parent = waypointList
-
-	local function refreshWaypoints()
-		for _, child in waypointList:GetChildren() do
-			if child:IsA("TextButton") then
-				child:Destroy()
-			end
-		end
-		local ok, message, names = call("listWaypoints")
-		setStatus(ok, message)
-		if ok and type(names) == "table" then
-			for _, name in names do
-				if type(name) == "string" then
-					makeButton(waypointList, name, UDim2.new(1, 0, 0, 26), function()
-						setStatus(call("teleportToWaypoint", name))
-					end)
-				end
-			end
-		end
-	end
-
-	do
-		local row = makeRow()
-		makeButton(row, "Refresh waypoint list", UDim2.fromScale(1, 1), refreshWaypoints)
-	end
-
-	------------------------------------------------------------------- HUD + toggle
-
-	local elapsed = 0
-	local frames = 0
-	RunService.RenderStepped:Connect(function(dt)
-		if not gui.Enabled then
-			return
-		end
-		elapsed += dt
-		frames += 1
-		if elapsed < 0.25 then
-			return
-		end
-		local fps = frames / elapsed
-		elapsed, frames = 0, 0
-
-		local pingOk, ping = pcall(function()
-			return (Stats :: any).Network.ServerStatsItem["Data Ping"]:GetValue()
-		end)
-		local lines = { string.format("FPS %.0f   Ping %s", fps, pingOk and string.format("%.0f ms", ping) or "n/a") }
-		local root = getRoot()
-		local character = localPlayer.Character
-		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-		if root then
-			local p = root.Position
-			table.insert(lines, "Pos   " .. Util.formatVec3(p.X, p.Y, p.Z))
-			table.insert(lines, string.format("Speed %.1f studs/s", root.AssemblyLinearVelocity.Magnitude))
-		end
-		if humanoid then
-			table.insert(lines, string.format("HP %.0f/%.0f  WS %.0f  JP %.0f", humanoid.Health, humanoid.MaxHealth, humanoid.WalkSpeed, humanoid.JumpPower))
-			table.insert(lines, "State " .. humanoid:GetState().Name)
-		end
-		hud.Text = table.concat(lines, "\n")
-	end)
-
-	UserInputService.InputBegan:Connect(function(input, gameProcessed)
-		if gameProcessed then
-			return
-		end
-		if input.KeyCode == Config.ToggleKey then
-			gui.Enabled = not gui.Enabled
-			if gui.Enabled then
-				refreshWaypoints()
-			end
-		end
-	end)
-
-	-- Fly is tied to the Humanoid's PlatformStand, so re-apply it on the new character after a respawn.
-	localPlayer.CharacterAdded:Connect(function(character)
-		if flyConnection then
-			character:WaitForChild("Humanoid", 10)
-			setFly(true)
-		end
-	end)
-end
-
-if RunService:IsServer() then
-	runServer()
-else
-	runClient()
-end
+task.delay(0.6, function()
+	Window:Notify({
+		Title = "Aurora carregada",
+		Text = "RightShift abre e fecha o painel.",
+		Duration = 5,
+	})
+end)
